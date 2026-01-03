@@ -2,6 +2,7 @@
 *.wav
 *.mp4
 /dataset/songs/
+/__pycache__/
 *.ipynb
 collect_data.py
 download_spotify_songs.py
