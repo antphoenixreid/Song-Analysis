@@ -1,0 +1,12 @@
+.cache
+*.wav
+*.mp4
+/dataset/songs/
+*.ipynb
+collect_data.py
+download_spotify_songs.py
+generate_spotify_dataset.py
+/jupyter
+key_signature_estimate.py
+plot_data.py
+pull_spotify_meta.py
