@@ -1045,7 +1045,7 @@ class TimeFeatures(AudioSignal):
 
 
     # ---------- STFT-based features (cached) ----------
-class STFTFeatures(TimeFeatures):
+class STFTFeatures(AudioSignal):
     def __init__(self, audio_path: str, N: int = 2048, H: int = 512,
                  pad_mode: str = 'constant', center: bool = True):
         super().__init__(audio_path, N=N, H=H)
