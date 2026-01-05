@@ -137,9 +137,13 @@ class AudioSignal:
         self._cache: Dict[str, object] = {}
 
 # ---------- Base Time Features ----------
-class TimeFeatures(AudioSignal):
-    def __init__(self, audio_path: str, N: int = 2048, H: int = 512):
-        super().__init__(audio_path, N, H)
+class TimeFeatures():
+    def __init__(self, sig: AudioSignal):
+        # super().__init__(audio_path, N, H)
+        self.y = sig.y
+        self.sr = sig.sr
+        self.N = sig.N
+        self.H = sig.H
 
         # global loudness check (too quiet to analyze)
         gl = self._global_loudness_dB()
@@ -1046,9 +1050,14 @@ class TimeFeatures(AudioSignal):
 
     # ---------- STFT-based features (cached) ----------
 class STFTFeatures(AudioSignal):
-    def __init__(self, audio_path: str, N: int = 2048, H: int = 512,
+    def __init__(self, sig: AudioSignal,
                  pad_mode: str = 'constant', center: bool = True):
-        super().__init__(audio_path, N=N, H=H)
+        # super().__init__(audio_path, N, H)
+        self.y = sig.y
+        self.sr = sig.sr
+        self.N = sig.N
+        self.H = sig.H
+
         # Recompute fft freqs with final N
         self._fft_freqs = librosa.fft_frequencies(sr=self.sr, n_fft=self.N)
 
@@ -1402,148 +1411,345 @@ class STFTFeatures(AudioSignal):
 
     # ---------- High-level perceptual features ----------
     # All three of these use robust normalization and are safe to call on silence
-    def speechiness(self) -> float:
-        zcr = self._zero_crossing_rate()
+    def loudness_stft(self) -> float:
+        if getattr(self, "invalid", False):
+            return 0.0
+        if "loudness_stft" in self._cache_spec:
+            return self._cache_spec["loudness_stft"]
+        
+        # Get Power Spectrum
+        P = self._pow_spectrogram()
+        if P.size == 0:
+            self._cache_spec["loudness_stft"] = -np.inf
+            return -np.inf
+        
+        freqs = self._fft_freqs[:P.shape[0]]
+
+        # Build K-weighting curve
+        f2 = freqs**2
+        hp = (f2/(f2 + 129.4**2))
+        shelf = ((f2 + 107.7**2)/(f2 + 737.9**2))
+
+        K = hp*shelf
+        K = np.sqrt(K) # amplitude scaling
+        K = K[:, None]
+
+        # Apply K-weighting
+        P_weighted = (P*(K**2))
+
+        # Frame energy (sum across freq)
+        frame_energy = np.sum(P_weighted, axis=0) + EPS
+
+        # Convert to LUFS
+        lufs_frames = -0.691 + 10.0*np.log10(frame_energy)
+
+        # ITU-style gating
+        gate = lufs_frames[lufs_frames > -70.0]
+        if gate.size == 0:
+            self._cache_spec["loudness_stft"] = -np.inf
+            return -np.inf
+        
+        # Relative gate: remove frames 10 LU below mean
+        mean_gate = np.mean(gate)
+        gate_final = gate[gate > (mean_gate - 10.0)]
+        if gate_final.size == 0:
+            loudness = float(mean_gate)
+        else:
+            loudness = float(np.mean(gate_final))
+
+        self._cache_spec["loudness_stft"] = loudness
+        return loudness
+    
+    def energy_stft(self) -> float:
+        if getattr(self, "invalid", False):
+            return 0.0
+        
+        if "energy_stft" in self._cache_spec:
+            return self._cache_spec["energy_stft"]
+        
+        # Extract features
+        E = self._stft_energy()
         flux = self._onset_env()
         flat = self._spectral_flatness()
-        hr = self._harmonic_ratio()
-        inh = self._inharmonicity()
-        slope = self._spectral_slope()
-        mid_energy = self._narrowband_energy(300, 3000)
+        ratio = self._band_ratio()
 
-        # align lengths safely
-        L = min_length(zcr, flux, flat, hr, inh, slope, mid_energy)
-        if L == 0:
+        # Normalize energy to 0-1
+        E_log = np.log10(E + EPS)
+        E_min = np.percentile(E_log, 5)
+        E_max = np.percentile(E_log, 95)
+        E_norm = np.clip((E_log - E_min)/(E_max - E_min + EPS), 0.0, 1.0)
+
+        # Normalize Band Ratio
+        ratio_norm = np.tanh(ratio)
+
+        # Weights
+        w_E = 0.45
+        w_flux = 0.25
+        w_flat = 0.15
+        w_ratio = 0.15
+
+        energy_frame = (
+            w_E*E_norm +
+            w_flux*flux +
+            w_flat*flat +
+            w_ratio*ratio_norm
+        )
+
+        # Smooth slightly 
+        smooth = np.convolve(energy_frame, np.ones(5)/5.0, mode='same')
+
+        # Final Scalar
+        energy = float(np.mean(smooth))
+
+        self._cache_spec["energy_stft"] = energy
+        return energy
+    
+    def speechiness_stft(self) -> float:
+        if getattr(self, "invalid", False):
             return 0.0
-        zcr, flux, flat = zcr[:L], flux[:L], flat[:L]
-        hr = np.nan_to_num(hr[:L], nan=safe_median(hr[:L], 0.0))
-        inh = np.nan_to_num(inh[:L], nan=safe_median(inh[:L], 0.0))
-        slope = np.nan_to_num(slope[:L], nan=safe_median(slope[:L], 0.0))
-        mid_energy = np.nan_to_num(mid_energy[:L], nan=safe_median(mid_energy[:L], 0.0))
-
-        # robust normalize each
-        zcr_n = robust_normalize(zcr)
-        flux_n = robust_normalize(flux)
-        flat_n = robust_normalize(flat)
-        hr_n = 1.0 - robust_normalize(hr)
-        inh_n = robust_normalize(inh)
-        slope_inv = 1.0 - robust_normalize(slope)
-        mid_n = robust_normalize(mid_energy)
-
-        # weights (tunable)
-        w_zcr = 0.20; w_flux = 0.20; w_flat = 0.20
-        w_mid = 0.15; w_inh = 0.10; w_slope = 0.10; w_hr = 0.05
-
-        frame_score = (w_zcr*zcr_n + w_flux*flux_n + w_flat*flat_n +
-                       w_mid*mid_n + w_inh*inh_n + w_slope*slope_inv + w_hr*hr_n)
-        score = float(np.mean(frame_score))
-        return safe_clip01(score)
-
-    def acousticness(self) -> float:
-        hr = self._harmonic_ratio()
+        if "speechiness_stft" in self._cache_spec:
+            return self._cache_spec["speechiness_stft"]
+        
+        # Feature extraction
+        E = self._stft_energy()
+        band_tel = self._narrowband_energy(300, 3400)
+        HR = self._harmonic_ratio()
         flat = self._spectral_flatness()
-        inh = self._inharmonicity()
-        entropy = self._spectral_entropy()
-        centroid = self._spectral_centroid()
-        mid_energy = self._narrowband_energy(300, 3000)
-        high_energy = self._narrowband_energy(6000, min(16000, self.sr // 2))
+        ratio = self._band_ratio()
 
-        L = min_length(hr, flat, inh, entropy, centroid, mid_energy, high_energy)
-        if L == 0:
+        # Normalize Components
+        E_log = np.log10(E + EPS)
+        E_min, E_max = np.percentile(E_log, [5, 95])
+        E_norm = np.clip((E_log - E_min)/(E_max - E_min + EPS), 0.0, 1.0)
+
+        # Telephone band dominance
+        tel_ratio = np.divide(band_tel, np.sum(E)/len(E) + EPS)
+        tel_ratio = np.clip(np.tanh(tel_ratio), 0.0, 1.0)
+
+        # Low harmonic ratio -> more speech-like
+        HR_inv = 1.0 - np.clip(HR, 0.0, 1.0)
+
+        # Flatness -> speech is mid-flat
+        flat_centered = 1.0 - np.abs(flat - 0.45)/0.45
+        flat_centered = np.clip(flat_centered, 0.0, 1.0)
+
+        # Avoid giving credit to bright/bass-heavy
+        brightness_penalty = np.clip(np.tanh(ratio), 0.0, 1.0)
+
+        # Weights
+        w_tel = 0.35
+        w_HR = 0.25
+        w_flat = 0.20
+        w_ratio = 0.15
+        w_E = 0.05
+
+        speechiness = (
+            w_tel*tel_ratio +
+            w_HR*HR_inv + 
+            w_flat*flat_centered +
+            w_ratio*(1.0 - brightness_penalty) +
+            w_E*(1.0 - E_norm)
+        )
+
+        # Smooth and summarize
+        smooth = np.convolve(speechiness, np.ones(7)/7.0, mode='same')
+        speech_val = float(np.mean(smooth))
+
+        # Clamp to [0,1]
+        speechiness = float(np.clip(speech_val, 0.0, 1.0))
+
+        self._cache_spec["speechiness_stft"] = speechiness
+        return speechiness
+    
+    def acousticness_stft(self) -> float:
+        if getattr(self, "invalid", False):
             return 0.0
-        hr = hr[:L]; flat = flat[:L]; inh = inh[:L]; entropy = entropy[:L]
-        centroid = centroid[:L]; mid_energy = mid_energy[:L]; high_energy = high_energy[:L]
+        if "acousticness_stft" in self._cache_spec:
+            return self._cache_spec["acousticness_stft"]
+        
+        # Feature extraction
+        HR = self._harmonic_ratio()
+        inh = self._inharmonicity()
+        flat = self._spectral_flatness()
+        ratio = self._band_ratio()
+        E = self._stft_energy()
 
-        hr_n = robust_normalize(hr)
-        flat_n = robust_normalize(flat)
-        inh_n = robust_normalize(inh)
-        ent_n = robust_normalize(entropy)
-        cent_n = robust_normalize(centroid)
+        # Normalize Components
+        E_log = np.log10(E + EPS)
+        E_min, E_max = np.percentile(E_log, [5, 95])
+        dyn = 1.0 - np.clip((E_log - E_min)/(E_max - E_min + EPS), 0.0, 1.0)
 
-        band_ratio = np.divide(high_energy, (mid_energy + high_energy + EPS))
-        band_n = robust_normalize(band_ratio)
+        HR_n = np.clip(HR, 0.0, 1.0)
+        inh_n = 1.0 - np.tanh(inh)
+        flat_weight = 1.0 - np.clip(flat/0.6, 0.0, 1.0)
 
-        # invert features where higher means "less acoustic"
-        flat_inv = 1.0 - flat_n
-        inh_inv = 1.0 - inh_n
-        ent_inv = 1.0 - ent_n
-        cent_inv = 1.0 - cent_n
-        band_inv = 1.0 - band_n
+        # brightness penalty
+        bright_penalty = np.clip(np.tanh(ratio), 0.0, 1.0)
 
-        # weights
-        w_hr = 0.30; w_flat = 0.20; w_inh = 0.15
-        w_ent = 0.10; w_cent = 0.10; w_band = 0.15
+        # Weights
+        w_HR = 0.35
+        w_inh = 0.25
+        w_flat = 0.20
+        w_dyn = 0.10
+        w_ratio = 0.10
 
-        frame_score = (w_hr*hr_n + w_flat*flat_inv + w_inh*inh_inv +
-                       w_ent*ent_inv + w_cent*cent_inv + w_band*band_inv)
-        track_score = float(np.median(frame_score))
-        return safe_clip01(track_score)
+        acoustic_frame = (
+            w_HR*HR_n +
+            w_inh*inh_n +
+            w_flat*flat_weight +
+            w_dyn*dyn +
+            w_ratio*(1.0 - bright_penalty)
+        )
 
-    def danceability(self) -> float:
+        # Smooth and summarize
+        smooth = np.convolve(acoustic_frame, np.ones(9)/9.0, mode='same')
+        acousticness = float(np.mean(smooth))
+
+        acousticness = float(np.clip(acousticness, 0.0, 1.0))
+        self._cache_spec["acousticness_stft"] = acousticness
+        return acousticness
+    
+    def danceability_stft(self) -> float:
+        if getattr(self, "invalid", False):
+            return 0.0
+        if "danceability_stft" in self._cache_spec:
+            return self._cache_spec["danceability_stft"]
+        
+        # Feature extraction
         onset = self._onset_env()
-        tempo_var, tempo_mean, tempo_stab = self._tempo_var()
-        bass = self._narrowband_energy(20, 250)
+        if onset.size < 8 or np.all(onset == 0):
+            self._cache_spec["danceability_stft"] = 0.05
+            return 0.05
+        
+        # Pulse Clarity
+        ac = np.correlate(onset, onset, mode='full')
+        ac = ac[len(ac)//2:]
+        if ac.size < 4:
+            self._cache_spec["danceability_stft"] = 0.05
+            return 0.05
+        
+        ac = ac/(np.max(ac) + EPS)
+
+        main_peak = np.max(ac[1:])
+        mean_rest = np.mean(ac[1:])
+        pulse_clarity = np.clip((main_peak - mean_rest)/(main_peak + EPS), 0.0, 1.0)
+
+        # Beat periodicity stability
+        lags = np.arange(1, len(ac))
+        hop_time = self.H/float(self.sr)
+        bpms = 60.0/(lags*hop_time + EPS)
+
+        mask = (bpms >= 60) & (bpms <= 180)
+        if np.any(mask):
+            periodicity = np.mean(ac[1:][mask])
+        else:
+            periodicity = np.mean(ac[1:])
+
+        periodicity = np.clip(periodicity, 0.0, 1.0)
+
+        # Spectral balance/density
+        flat = self._spectral_flatness()
+        band = self._band_ratio()
+        energy = self._stft_energy()
+
+        # too flat = less danceable
+        flat_n = 1.0 - np.clip(flat/0.8, 0.0, 1.0)
+
+        # prefer controlled brightness
+        bright = np.clip(np.tanh(band), 0.0, 1.0)
+        bright_pref = 1.0 - bright
+
+        # Normalize dynamics
+        E_log = np.log10(energy + EPS)
+        E_min, E_max = np.percentile(E_log, [5, 95])
+        dyn = 1.0 - np.clip((E_log - E_min)/(E_max - E_min + EPS), 0.0, 1.0)
+
+        # Weights
+        w_pulse = 0.35
+        w_period = 0.25
+        w_flat = 0.15
+        w_bright = 0.15
+        w_dyn = 0.10
+
+        dance_frame = (
+            w_pulse*pulse_clarity +
+            w_period*periodicity +
+            w_flat*flat_n +
+            w_bright*bright_pref +
+            w_dyn*np.mean(dyn)
+        )
+
+        # Smooth and summarize
+        smooth = np.convolve(dance_frame, np.ones(7)/7.0, mode='same')
+        danceability = float(np.mean(smooth))
+        danceability = float(np.clip(danceability, 0.0, 1.0))
+        self._cache_spec["danceability_stft"] = danceability
+        return danceability
+    
+    def valence_stft(self) -> float:
+        if getattr(self, "invalid", False):
+            return 0.0
+        if "valence_stft" in self._cache_spec:
+            return self._cache_spec["valence_stft"]
+        
+        S = self._amp_spectrogram()
+        if S.size == 0:
+            self._cache_spec["valence_stft"] = 0.0
+            return 0.0
+        
+        # Feature extraction
         centroid = self._spectral_centroid()
         flat = self._spectral_flatness()
-        entropy = self._spectral_entropy()
+        HR = self._harmonic_ratio()
+        slope = self._spectral_slope()
+        band = self._band_ratio()
+        onset = self._onset_env()
 
-        L = min_length(onset, bass, centroid, flat, entropy)
-        if L == 0:
+        # Normalize Components
+        nyq = self.sr/2.0
+        bright = np.clip(centroid/(0.6*nyq), 0.0, 1.0)
+
+        harm = np.clip(HR/0.4, 0.0, 1.0)
+
+        noise_penalty = np.clip(flat/0.6, 0.0, 1.0)
+        noise_inv = 1.0 - noise_penalty
+
+        slope_n = np.tanh(0.002*slope)
+        slope_pref = 1.0 - np.clip(np.abs(slope_n), 0.0, 1.0)
+
+        band_n = np.clip(np.tanh(band), 0.0, 1.0)
+        brightness_balance = 1.0 - np.clip(band_n*0.9, 0.0, 1.0)
+
+        onset_var = np.var(onset)
+        rhythm = np.clip(onset_var/(np.mean(onset) + EPS + onset_var), 0.0, 1.0)
+
+        # Weights
+        w_bright = 0.28
+        w_hr = 0.20
+        w_noise = 0.18
+        w_slope = 0.14
+        w_bal = 0.12
+        w_rhy = 0.08
+
+        valence = (
+            w_bright*np.mean(bright) +
+            w_hr*np.mean(harm) + 
+            w_noise*np.mean(noise_inv) + 
+            w_slope*np.mean(slope_pref) +
+            w_bal*np.mean(brightness_balance) + 
+            w_rhy*np.mean(rhythm)
+        )
+
+        valence = float(np.clip(valence, 0.0, 1.0))
+        self._cache_spec["valence_stft"] = valence
+        return valence 
+    
+    def tempo_stft(self, bpm_min: float = 40.0, bpm_max: float = 220.0, bias_around: float = 120.0) -> float:
+        if getattr(self, "invalid", False):
             return 0.0
-        onset = onset[:L]; bass = bass[:L]; centroid = centroid[:L]
-        flat = flat[:L]; entropy = entropy[:L]
-
-        onset_n = robust_normalize(onset)
-        bass_n = robust_normalize(bass)
-        centroid_n = robust_normalize(centroid)
-        flat_n = robust_normalize(flat)
-        ent_n = robust_normalize(entropy)
-
-        centroid_inv = 1.0 - centroid_n
-        flat_inv = 1.0 - flat_n
-        ent_inv = 1.0 - ent_n
-
-        # pulse clarity via FFT autocorr
-        ac = fft_autocorr(onset_n)
-        if ac.size == 0:
-            pulse_clarity = 0.0
-        else:
-            ac_pos = ac[len(ac)//2:]
-            if np.max(ac_pos) <= 0:
-                pulse_clarity = 0.0
-            else:
-                ac_pos = ac_pos / (np.max(ac_pos) + EPS)
-                # reasonable lag window: 60-200 bpm mapped to lags
-                min_lag = int(round((60.0 / 200.0) * (self.sr / float(self.H))))
-                max_lag = int(round((60.0 / 60.0) * (self.sr / float(self.H))))
-                min_lag = min(min_lag, len(ac_pos) - 1)
-                max_lag = min(max_lag, len(ac_pos))
-                if max_lag > min_lag:
-                    pulse_clarity = float(np.max(ac_pos[min_lag:max_lag]))
-                else:
-                    pulse_clarity = 0.0
-
-        # tempo score preference
-        if tempo_mean == 0:
-            tempo_score = 0.0
-        else:
-            bpm = tempo_mean
-            if 80 <= bpm <= 130:
-                tempo_score = 1.0
-            elif 160 <= bpm <= 200:
-                tempo_score = 0.8
-            else:
-                tempo_score = np.exp(-((bpm - 110.0) / 50.0)**2)
-
-        tempo_stab = float(max(0.0, min(1.0, tempo_stab)))
-
-        # weights
-        w_onset = 0.25; w_bass = 0.20; w_pulse = 0.15
-        w_cent = 0.10; w_flat = 0.10; w_ent = 0.10; w_tempo = 0.10
-
-        frame = (w_onset*onset_n + w_bass*bass_n + w_pulse*pulse_clarity +
-                 w_cent*centroid_inv + w_flat*flat_inv + w_ent*ent_inv +
-                 w_tempo*tempo_stab)
-        frame_score = float(np.median(frame))
-        dance = 0.6 * frame_score + 0.4 * float(np.clip(tempo_score, 0.0, 1.0))
-        return safe_clip01(dance)
+        if "tempo_stft" in self._cache_spec:
+            return self._cache_spec["tempo_stft"]
+        
+        onset = self._onset_env()
+        if onset.size < 4:
+            self._cache_spec
