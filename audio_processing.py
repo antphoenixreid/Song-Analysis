@@ -1752,4 +1752,261 @@ class STFTFeatures(AudioSignal):
         
         onset = self._onset_env()
         if onset.size < 4:
-            self._cache_spec
+            self._cache_spec["tempo_stft"] = 0.0
+            return 0.0
+        
+        # Normalize and smooth 
+        onset - np.min(onset)
+        if np.max(onset) > 0:
+            onset = onset/(np.max(onset) + EPS)
+
+        win = 5
+        onset_smooth = np.convolve(onset, np.ones(win)/win, mode="same")
+
+        # Autocorrelation
+        ac = np.correlate(onset_smooth, onset_smooth, mode="full")
+        ac = ac[ac.size//2:]
+        ac[0] = 0.0
+
+        # Convert lags -> BPM grid
+        lags = np.arange(1, len(ac))
+        seconds_per_lag = (lags*self.H)/float(self.sr)
+        bpm = 60.0/np.maximum(seconds_per_lag, EPS)
+
+        # Keep BPM inside constraints
+        valid = (bpm >= bpm_min) & (bpm <= bpm_max)
+        if not np.any(valid):
+            self._cache_spec["tempo_stft"] = 0.0
+            return 0.0
+        
+        bpm = bpm[valid]
+        ac = ac[valid]
+
+        # Bias function: center around "typical" tempos
+        bias = np.exp(-0.5*((bpm - bias_around)/40.0)**2)
+        score = ac*bias
+
+        best = bpm[np.argmax(score)]
+
+        # Snap tempo into perceptually plausible pocket near bias_around
+        while best > 1.5*bias_around:
+            best /= 2.0
+        while best < 0.75*bias_around:
+            best *= 2.0
+
+        tempo = float(np.clip(best, bpm_min, bpm_max))
+        self._cache_spec["tempo_stft"] = tempo
+        return tempo 
+    
+    def liveness_stft(self) -> float:
+        if getattr(self, "invalid", False):
+            return 0.0
+        if "liveness_stft" in self._cache_spec:
+            return self._cache_spec["liveness_stft"]
+        
+        # Feature Extraction
+        flat = self._spectral_flatness()
+        entr = self._spectral_entropy()
+        inh = self._inharmonicity()
+        roll = self.spectral_rolloff(0, 90)
+        energy = self._stft_energy()
+        onset = self._onset_env()
+
+        # Align
+        L = min(len(flat), len(entr), len(inh), len(roll), len(energy), len(onset))
+        if L == 0:
+            self._cache_spec["liveness_stft"] = 0.0
+            return 0.0
+        
+        flat = flat[:L]
+        entr = entr[:L]
+        inh = inh[:L]
+        roll = roll[:L]
+        energy = energy[:L]
+        onset = onset[:L]
+
+        # Dynamic looseness: variance across frames
+        dyn_var = np.var(robust_normalize(energy))
+
+        # Onset Irregularity
+        onset_diff = np.abs(np.diff(onset, prepend=onset[0]))
+        onset_irreg = np.mean(robust_normalize(onset_diff))
+
+        # Normalize 
+        flat_n = robust_normalize(flat)
+        entr_n = robust_normalize(entr)
+        inh_n = robust_normalize(inh)
+        roll_n = robust_normalize(roll)
+
+        # weights (tuned heuristically)
+        w_flat = 0.30
+        w_ent  = 0.20
+        w_inh  = 0.15
+        w_roll = 0.10
+        w_dyn  = 0.15
+        w_ir   = 0.15
+
+        frame_score = (w_flat * flat_n +
+                    w_ent  * entr_n +
+                    w_inh  * inh_n +
+                    w_roll * roll_n)
+
+        track_score = (0.7 * float(np.median(frame_score)) +
+                    w_dyn * float(np.clip(dyn_var, 0.0, 1.0)) +
+                    w_ir * float(np.clip(onset_irreg, 0.0, 1.0)))
+
+        score = safe_clip01(track_score)
+
+        self._cache_spec["liveness_stft"] = score
+        return score
+    
+    def instrumentalness(self) -> float:
+        if getattr(self, "invalid", False):
+            return 0.0
+        if "instrumentalness_stft" in self._cache_spec:
+            return self._cache_spec["instrumentalness_stft"]
+        
+        # Feature Extraction
+        hr = self._harmonic_ratio()
+        inh = self._inharmonicity()
+        flat = self._spectral_flatness()
+        entr = self._spectral_entropy()
+        mid = self._narrowband_energy()
+        bass = self._narrowband_energy(20, 250)
+        onset = self._onset_env()
+
+        # Align
+        L = min(len(flat), len(entr), len(inh), len(hr), len(mid), len(bass), len(onset))
+        if L == 0:
+            self._cache_spec["instrumentalness_stft"] = 0.0
+            return 0.0
+        
+        hr = np.nan_to_num(hr[:L])
+        inh = np.nan_to_num(inh[:L])
+        flat = flat[:L]
+        entr = entr[:L]
+        mid = mid[:L]
+        bass = bass[:L]
+        onset = onset[:L]
+
+        # Normalize 
+        hr_n = robust_normalize(hr)
+        inh_n = robust_normalize(inh)
+        flat_n = robust_normalize(flat)
+        entr_n = robust_normalize(entr)
+
+        # Mid vs Bass ratio
+        mid_ratio = np.divide(mid + bass + EPS)
+        mid_n = robust_normalize(mid_ratio)
+
+        # Articulation
+        onset_diff = np.abs(np.diff(onset, prepend=onset[0]))
+        onset_irreg = robust_normalize(onset_diff)
+
+        # Weights
+        w_hr = 0.35
+        w_mid = 0.25
+        w_flat = 0.20
+        w_entr = 0.10
+        w_onset = 0.10
+
+        # Vocals: high harmonic ratio, strong mids, low flatness/entropy
+        vocal_likelihood = (
+            w_hr*hr_n +
+            w_mid*mid_n + 
+            w_flat*(1.0 - flat_n) +
+            w_entr*(1.0 - entr_n) + 
+            w_onset*(1.0 - onset_irreg)
+        )
+
+        vocal_score = float(np.median(vocal_likelihood))
+
+        # Instrumentalness = Inverse
+        instrumentalness = 1.0 - vocal_score
+        instrumentalness = safe_clip01(instrumentalness)
+        self._cache_spec["instrumentalness_stft"] = instrumentalness
+        return instrumentalness
+    
+    def time_sig_freq(self) -> int:
+        if getattr(self, "invalid", False):
+            return 0.0
+        if "time_signature_stft" in self._cache_spec:
+            return self._cache_spec["time_signature_stft"]
+        
+        meters=[2, 3, 4, 5, 6, 7]
+        
+        onset = self._onset_env()
+        if onset.size < 16 or np.all(onset == 0):
+            self._cache_spec["time_signature_stft"] = 4
+            return 4
+        
+        # Beat Tracking (frame domain)
+        try:
+            tempo, beats = librosa.beat.beat_track(onset_envelope=onset,
+                                                   sr=self.sr,
+                                                   hop_length=self.H,
+                                                   tightness=80)
+        except Exception:
+            self._cache_spec["time_signature_stft"] = 4
+            return 4
+        
+        if beats.size < 6:
+            self._cache_spec["time_signature_stft"] = 4
+            return 4
+        
+        beats = beats.astype(int)
+        beats = beats[beats < len(onset)]
+
+        # Beat Strength Sequence
+        beat_strength = onset[beats]
+
+        if beat_strength.size < 6:
+            self._cache_spec["time_signature_stft"] = 4
+            return 4
+        
+        # Normalize
+        if np.max(beat_strength) > 0:
+            beat_strength = beat_strength/(np.max(beat_strength) + EPS)
+
+        # Score each meter
+        best_m = 4
+        best_score = -1.0
+
+        for m in meters:
+            if len(beat_strength) < 2*m:
+                continue
+
+            # reshape into bars with length m (truncate excess)
+            L = (len(beat_strength)//m)*m
+            seg = beat_strength[:L].reshape(-1, m)
+
+            # Mean Bar Profile
+            proto = np.mean(seg, axis=0)
+
+            # Normalize Prototype
+            if np.max(proto) > 0:
+                proto = proto/(np.max(proto) + EPS)
+
+            # Autocorrelation of prototype - periodic clarity
+            ac = np.correlate(proto, proto, mode='full')
+            ac = ac[len(ac)//2:]
+
+            # Ignore lag 0
+            if ac.size > 1:
+                ac = ac/(np.max(ac) + EPS)
+                clarity = float(np.max(ac[1:]))
+            else:
+                clarity = 0.0
+
+            # Penalty for meters that rarely fit popular music
+            penalty = 1.0
+            if m in (5, 7):
+                penalty = 0.9
+
+            score = clarity*penalty
+            if score > best_score:
+                best_score = score
+                best_m = m
+
+            self._cache_spec["time_signature_stft"] = int(best_m)
+            return int(best_m)
