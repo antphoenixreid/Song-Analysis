@@ -1860,7 +1860,7 @@ class STFTFeatures(AudioSignal):
         self._cache_spec["liveness_stft"] = score
         return score
     
-    def instrumentalness(self) -> float:
+    def instrumentalness_stft(self) -> float:
         if getattr(self, "invalid", False):
             return 0.0
         if "instrumentalness_stft" in self._cache_spec:
