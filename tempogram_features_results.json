@@ -1,0 +1,395 @@
+{
+  "timestamp": "2026-04-28T23:58:13.517449",
+  "tests": {
+    "onset_strength": {
+      "status": "PASS",
+      "details": {
+        "signals_tested": 4,
+        "validation": "rhythmic > sustained onset strength"
+      },
+      "metrics": {
+        "click_120bpm": {
+          "max": 36.95295826658122,
+          "mean": 1.9064306853661446,
+          "std": 6.602935086716357,
+          "num_peaks": 15
+        },
+        "click_60bpm": {
+          "max": 36.10316643046525,
+          "mean": 0.8886725175034473,
+          "std": 4.79746341495126,
+          "num_peaks": 7
+        },
+        "drum_rock": {
+          "max": 23.558356833645995,
+          "mean": 1.1083171319323912,
+          "std": 3.800916547302427,
+          "num_peaks": 15
+        },
+        "sustained_tone": {
+          "max": 0.048607272409600416,
+          "mean": 0.0005968351350418969,
+          "std": 0.0026097766348444204,
+          "num_peaks": 103
+        }
+      }
+    },
+    "onset_energy": {
+      "status": "PASS",
+      "details": {
+        "signals_tested": 3,
+        "ordered_correctly": true
+      },
+      "metrics": {
+        "many_onsets": {
+          "normalized": 2.9225543492111425,
+          "total": 1008.2812504778442
+        },
+        "few_onsets": {
+          "normalized": 0.6354946563581577,
+          "total": 219.24565644356443
+        },
+        "sustained": {
+          "normalized": 0.0005968351350418969,
+          "total": 0.20590812158945446
+        }
+      }
+    },
+    "transient_curve": {
+      "status": "PASS",
+      "details": {
+        "signals_tested": 3,
+        "validation": "sharp > soft attack slope"
+      },
+      "metrics": {
+        "sharp_attacks": {
+          "peak_count": 15,
+          "mean_slope": 0.17478089105752048
+        },
+        "soft_attacks": {
+          "peak_count": 15,
+          "mean_slope": 0.17234455169018276
+        },
+        "drum_pattern": {
+          "peak_count": 27,
+          "mean_slope": 0.15281568707391774
+        }
+      }
+    },
+    "envelope_periodicity": {
+      "status": "PASS",
+      "details": {
+        "signals_tested": 4,
+        "validation": "periodic > sustained periodicity"
+      },
+      "metrics": {
+        "120_bpm": {
+          "periodicity": 0.8832864425519706,
+          "estimated_bpm": 60.09265988372093
+        },
+        "90_bpm": {
+          "periodicity": 0.8371737457453284,
+          "estimated_bpm": 89.10290948275862
+        },
+        "irregular": {
+          "periodicity": 0.889304407358544,
+          "estimated_bpm": 60.09265988372093
+        },
+        "sustained": {
+          "periodicity": 0.04102619476100776,
+          "estimated_bpm": 2583.984375
+        }
+      }
+    },
+    "comprehensive_onset": {
+      "status": "PASS",
+      "details": {
+        "signals_tested": 5,
+        "features_tested": 4
+      },
+      "metrics": {}
+    },
+    "global_bpm": {
+      "status": "PASS",
+      "details": {
+        "signals_tested": 4,
+        "results": [
+          {
+            "name": "60_bpm",
+            "expected_bpm": 60,
+            "detected_bpm": 60.09265988372093,
+            "error": 0.09265988372092693,
+            "strength": 1.763617670345743
+          },
+          {
+            "name": "120_bpm",
+            "expected_bpm": 120,
+            "detected_bpm": 117.45383522727273,
+            "error": 2.5461647727272663,
+            "strength": 1.4482149826894268
+          },
+          {
+            "name": "180_bpm",
+            "expected_bpm": 180,
+            "detected_bpm": 184.5703125,
+            "error": 4.5703125,
+            "strength": 1.6210478544529106
+          },
+          {
+            "name": "90_bpm",
+            "expected_bpm": 90,
+            "detected_bpm": 89.10290948275862,
+            "error": 0.8970905172413808,
+            "strength": 1.674347491490651
+          }
+        ]
+      },
+      "metrics": {
+        "avg_error": 2.0265569184223935
+      }
+    },
+    "local_bpm_curve": {
+      "status": "PASS",
+      "details": {
+        "signals_tested": 3,
+        "note": "Tempo tracking over time"
+      },
+      "metrics": {}
+    },
+    "pulse_clarity": {
+      "status": "PASS",
+      "details": {
+        "signals_tested": 3,
+        "ordered_correctly": true
+      },
+      "metrics": {
+        "strong_pulse": 0.19216184778897993,
+        "weak_pulse": 0.18125455680032607,
+        "no_pulse": 0.05020802608994521
+      }
+    },
+    "tempo_stability": {
+      "status": "WARN",
+      "details": {
+        "signals_tested": 4,
+        "ordered_correctly": false
+      },
+      "metrics": {
+        "perfectly_stable": 0.9999999999999998,
+        "slight_variation": 0.9999999999999998,
+        "moderate_variation": 1.0,
+        "large_variation": 1.0
+      }
+    },
+    "multi_periodic_structure": {
+      "status": "PASS",
+      "details": {
+        "signals_tested": 4,
+        "note": "Multi-periodic structure detected"
+      },
+      "metrics": {
+        "single_tempo": 1.682929465040665,
+        "with_half": 1.6825992603556723,
+        "with_double": 1.6712391747057895,
+        "polyrhythm": 1.6712424691768044
+      }
+    },
+    "swing_ratio": {
+      "status": "PASS",
+      "details": {
+        "signals_tested": 3,
+        "note": "Swing ratios computed"
+      },
+      "metrics": {
+        "straight": {
+          "ratio": -0.6234221194903828,
+          "symmetry": NaN
+        },
+        "triplet_swing": {
+          "ratio": -0.08580359809131141,
+          "symmetry": NaN
+        },
+        "heavy_swing": {
+          "ratio": -0.34020190887337914,
+          "symmetry": NaN
+        }
+      }
+    },
+    "comprehensive_tempogram": {
+      "status": "PASS",
+      "details": {
+        "signals_tested": 4,
+        "features_tested": 5
+      },
+      "metrics": {}
+    },
+    "tempo_spectrum": {
+      "status": "PASS",
+      "details": {
+        "signals_tested": 3,
+        "note": "Tempo spectrum computed"
+      },
+      "metrics": {}
+    },
+    "spectral_energy_at_tempo": {
+      "status": "PASS",
+      "details": {
+        "signal_tempo": 120,
+        "detected_peak": 120,
+        "is_correct": true
+      },
+      "metrics": {
+        "energies": {
+          "60": 40.61808700496458,
+          "90": 30.84861612982364,
+          "120": 796.9848028707913,
+          "150": 36.29230160660016,
+          "180": 38.74380621004914
+        }
+      }
+    },
+    "dominant_tempo_energy": {
+      "status": "PASS",
+      "details": {
+        "signals_tested": 3,
+        "note": "Top k tempo peaks identified"
+      },
+      "metrics": {}
+    },
+    "tempo_spectral_moments": {
+      "status": "PASS",
+      "details": {
+        "signals_tested": 5,
+        "note": "All spectral moments computed"
+      },
+      "metrics": {
+        "narrow_120": {
+          "centroid": 153.39380790398263,
+          "bandwidth": 56.84542917960474,
+          "skewness": 0.35862298060739484,
+          "kurtosis": -1.1616910486050076
+        },
+        "wide_multi": {
+          "centroid": 146.29552802922947,
+          "bandwidth": 56.58518792367609,
+          "skewness": -0.1727475763405088,
+          "kurtosis": -0.9951980784765606
+        },
+        "skewed_low": {
+          "centroid": 161.07917805099768,
+          "bandwidth": 52.997188779003615,
+          "skewness": -0.5579326037835395,
+          "kurtosis": -0.6675022251660265
+        },
+        "variable_tempo": {
+          "centroid": 153.93226171497412,
+          "bandwidth": 52.230506130085146,
+          "skewness": 0.24467547956538485,
+          "kurtosis": -1.1906880307005256
+        },
+        "with_jitter": {
+          "centroid": 151.7065218830288,
+          "bandwidth": 55.839365679947825,
+          "skewness": 0.4050588747800833,
+          "kurtosis": -1.070844045748835
+        }
+      }
+    },
+    "comprehensive_fourier": {
+      "status": "PASS",
+      "details": {
+        "signals_tested": 3,
+        "features_tested": 5
+      },
+      "metrics": {}
+    },
+    "beat_position": {
+      "status": "PASS",
+      "details": {
+        "modes_tested": 3,
+        "beat_period": 0.5,
+        "note": "Beat position tracked in different modes"
+      },
+      "metrics": {
+        "beat_period_sec": 0.5,
+        "expected_period": 0.5
+      }
+    },
+    "beat_alignment_histogram": {
+      "status": "PASS",
+      "details": {
+        "cases_tested": 3,
+        "note": "Beat alignment histograms computed"
+      },
+      "metrics": {}
+    },
+    "interbeat_interval_variance": {
+      "status": "PASS",
+      "details": {
+        "cases_tested": 4,
+        "ordered_correctly": true
+      },
+      "metrics": {
+        "perfect_timing": {
+          "normalized": 0.0,
+          "raw": 0.0
+        },
+        "slight_jitter": {
+          "normalized": 0.0007203198600396752,
+          "raw": 0.00017996036822751248
+        },
+        "moderate_jitter": {
+          "normalized": 0.009023591741016633,
+          "raw": 0.0022567013477915194
+        },
+        "high_jitter": {
+          "normalized": 0.033843450339463545,
+          "raw": 0.008149298339716102
+        }
+      }
+    },
+    "beat_sync_offset": {
+      "status": "WARN",
+      "details": {
+        "cases_tested": 4,
+        "avg_error": 0.16937500000000003
+      },
+      "metrics": {
+        "on_beat": {
+          "mean_offset": 0.025,
+          "mean_abs_offset": 0.025,
+          "expected": 0.0
+        },
+        "slightly_early": {
+          "mean_offset": 0.45249999999999985,
+          "mean_abs_offset": 0.45249999999999985,
+          "expected": -0.025
+        },
+        "slightly_late": {
+          "mean_offset": 0.05000000000000019,
+          "mean_abs_offset": 0.05000000000000019,
+          "expected": 0.025
+        },
+        "quarter_beat_late": {
+          "mean_offset": 0.15,
+          "mean_abs_offset": 0.15,
+          "expected": 0.125
+        }
+      }
+    },
+    "comprehensive_beat_timing": {
+      "status": "PASS",
+      "details": {
+        "signals_tested": 3,
+        "features_tested": 3
+      },
+      "metrics": {}
+    }
+  },
+  "summary": {
+    "total_tests": 22,
+    "passed": 20,
+    "failed": 0,
+    "warnings": 2
+  }
+}

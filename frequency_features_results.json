@@ -1,0 +1,688 @@
+{
+  "timestamp": "2026-04-28T23:57:31.439645",
+  "tests": {
+    "magnitude_spectrum": {
+      "status": "PASS",
+      "details": {
+        "signals_tested": 10,
+        "successful": 10
+      },
+      "metrics": {
+        "success_rate": 1.0,
+        "avg_magnitude": 0.583579410631918
+      }
+    },
+    "power_spectrum": {
+      "status": "PASS",
+      "details": {
+        "test_cases": 4,
+        "validation": "power = magnitude\u00b2"
+      },
+      "metrics": {
+        "max_error": 0.0,
+        "avg_error": 0.0
+      }
+    },
+    "band_energy_basic": {
+      "status": "PASS",
+      "details": {
+        "total_signals": 3,
+        "correct_predictions": 3
+      },
+      "metrics": {
+        "accuracy": 1.0
+      }
+    },
+    "spectral_centroid_basic": {
+      "status": "PASS",
+      "details": {
+        "total_signals": 5,
+        "correct": "5",
+        "results": [
+          {
+            "name": "low_100hz",
+            "expected": 100,
+            "actual": 99.92284197895793,
+            "error": 0.0771580210420666,
+            "correct": "True"
+          },
+          {
+            "name": "mid_1000hz",
+            "expected": 1000,
+            "actual": 999.9359853461352,
+            "error": 0.06401465386477412,
+            "correct": "True"
+          },
+          {
+            "name": "high_5000hz",
+            "expected": 5000,
+            "actual": 4999.991675169914,
+            "error": 0.008324830086166912,
+            "correct": "True"
+          },
+          {
+            "name": "two_tones",
+            "expected": 1000,
+            "actual": 999.8821859991696,
+            "error": 0.11781400083043536,
+            "correct": "True"
+          },
+          {
+            "name": "weighted_tones",
+            "expected": 400,
+            "actual": 319.88567793140106,
+            "error": 80.11432206859894,
+            "correct": "True"
+          }
+        ]
+      },
+      "metrics": {
+        "accuracy": 1.0,
+        "avg_error": 16.076326714884477
+      }
+    },
+    "spectral_bandwidth": {
+      "status": "PASS",
+      "details": {
+        "signals_tested": 5,
+        "validation": "white noise BW >> pure sine BW"
+      },
+      "metrics": {
+        "narrow_bandwidth": 8.263718819906202,
+        "wide_bandwidth": 3160.5381566335805,
+        "ratio": 382.45954702866504
+      }
+    },
+    "spectral_rolloff": {
+      "status": "PASS",
+      "details": {
+        "signals_tested": 3,
+        "percentiles_tested": [
+          0.5,
+          0.85,
+          0.95
+        ],
+        "validation": "rolloff increases with percentage"
+      },
+      "metrics": {
+        "bass_rolloff_85": 215.33203125,
+        "treble_rolloff_85": 4995.950633081897
+      }
+    },
+    "spectral_slope": {
+      "status": "WARN",
+      "details": {
+        "signals_tested": 3,
+        "slopes": {
+          "pink_noise": {
+            "linear": -0.006107581904550365,
+            "log": -0.0004747023514683449
+          },
+          "white_noise": {
+            "linear": -2.751559216723904e-05,
+            "log": -4.8864522874372934e-06
+          },
+          "high_emphasis": {
+            "linear": -0.11900655109080659,
+            "log": -0.001069484795598958
+          }
+        }
+      },
+      "metrics": {
+        "pink_slope": -0.006107581904550365,
+        "white_slope": -2.751559216723904e-05,
+        "high_slope": -0.11900655109080659
+      }
+    },
+    "spectral_skewness": {
+      "status": "PASS",
+      "details": {
+        "signals_tested": 3
+      },
+      "metrics": {
+        "symmetric": 1.7312228808655983,
+        "right_skewed": 3.7497305009801845,
+        "left_skewed": -3.7400944696972966
+      }
+    },
+    "spectral_kurtosis": {
+      "status": "PASS",
+      "details": {
+        "signals_tested": 3,
+        "validation": "single tone > white noise kurtosis"
+      },
+      "metrics": {
+        "tone_kurtosis": 417.49366904097286,
+        "noise_kurtosis": -1.207930120033664
+      }
+    },
+    "comprehensive_spectral_shape": {
+      "status": "PASS",
+      "details": {
+        "signals_tested": 6,
+        "features_tested": 6
+      },
+      "metrics": {
+        "Pure 440 Hz_centroid": 439.930946324292,
+        "Pure 440 Hz_bandwidth": 7.490374019552618,
+        "Pure 440 Hz_rolloff_85": 441.8019261853448,
+        "Pure 440 Hz_slope": -0.04740043987112209,
+        "Pure 440 Hz_skewness": 1.6757299731962203,
+        "Pure 440 Hz_kurtosis": 505.77926660364045,
+        "White Noise_centroid": 361.1585543596556,
+        "White Noise_bandwidth": 253.62813972669616,
+        "White Noise_rolloff_85": 656.5151872306035,
+        "White Noise_slope": -0.07178902566691614,
+        "White Noise_skewness": 2.065179121098823,
+        "White Noise_kurtosis": 4.262889342985277
+      }
+    },
+    "fundamental_frequency": {
+      "status": "PASS",
+      "details": {
+        "total_signals": 4,
+        "correct": "4",
+        "results": [
+          {
+            "name": "A110",
+            "expected": 110,
+            "actual": 107.666015625,
+            "error": 2.333984375,
+            "correct": "True"
+          },
+          {
+            "name": "A220",
+            "expected": 220,
+            "actual": 215.33203125,
+            "error": 4.66796875,
+            "correct": "True"
+          },
+          {
+            "name": "A440",
+            "expected": 440,
+            "actual": 441.4306640625,
+            "error": 1.4306640625,
+            "correct": "True"
+          },
+          {
+            "name": "C523",
+            "expected": 523,
+            "actual": 527.5634765625,
+            "error": 4.5634765625,
+            "correct": "True"
+          }
+        ]
+      },
+      "metrics": {
+        "accuracy": 1.0,
+        "avg_error": 3.2490234375
+      }
+    },
+    "harmonic_ratio": {
+      "status": "WARN",
+      "details": {
+        "signals_tested": 4,
+        "validation": "harmonic HR > noise HR",
+        "note": "Method has typo: _harmonnic_ratio (should be _harmonic_ratio)"
+      },
+      "metrics": {
+        "harmonic_hr": 0.22938948249178362,
+        "noise_hr": 0.1538910887640598,
+        "ratio": 1.4905962673607125
+      }
+    },
+    "inharmonicity": {
+      "status": "PASS",
+      "details": {
+        "signals_tested": 3,
+        "validation": "inharmonic > perfect harmonics"
+      },
+      "metrics": {
+        "perfect_inh": 0.00913412005737496,
+        "inharmonic_inh": 0.05353178061403052
+      }
+    },
+    "spectral_peaks": {
+      "status": "PASS",
+      "details": {
+        "signals_tested": 2,
+        "note": "Visual validation required"
+      },
+      "metrics": {
+        "avg_peaks_per_frame": 5.0
+      }
+    },
+    "hnr": {
+      "status": "PASS",
+      "details": {
+        "signals_tested": 3,
+        "validation": "pure harmonic HNR > noise HNR + 10 dB"
+      },
+      "metrics": {
+        "pure_hnr": 11.63900518469801,
+        "noise_hnr": -14.254699591470692,
+        "difference": 25.893704776168704
+      }
+    },
+    "spectral_envelope": {
+      "status": "PASS",
+      "details": {
+        "signals_tested": 3,
+        "bands": 5
+      },
+      "metrics": {}
+    },
+    "comprehensive_harmonic_timbre": {
+      "status": "PASS",
+      "details": {
+        "signals_tested": 4,
+        "features_tested": 4
+      },
+      "metrics": {}
+    },
+    "spectral_flatness": {
+      "status": "WARN",
+      "details": {
+        "signals_tested": 5,
+        "in_range": "3",
+        "ordered_correctly": "True"
+      },
+      "metrics": {
+        "sine_flatness": 1.9203523155213113e-06,
+        "noise_flatness": 0.5604432529324326,
+        "ratio": 291843.9748803547
+      }
+    },
+    "spectral_entropy": {
+      "status": "PASS",
+      "details": {
+        "signals_tested": 4,
+        "validation": "noise entropy > tone entropy"
+      },
+      "metrics": {
+        "tone_entropy": 0.12934877693365363,
+        "noise_entropy": 0.9385887026912232,
+        "ratio": 7.256262679411726
+      }
+    },
+    "spectral_flux": {
+      "status": "PASS",
+      "details": {
+        "signals_tested": 4,
+        "validation": "dynamic signals > constant"
+      },
+      "metrics": {
+        "constant_flux": 0.004179965546104822,
+        "noise_flux": 0.525157110782104,
+        "sweep_flux": 0.6412010810353688
+      }
+    },
+    "band_ratios": {
+      "status": "WARN",
+      "details": {
+        "signals_tested": 4,
+        "correct_predictions": 3
+      },
+      "metrics": {
+        "accuracy": 0.75
+      }
+    },
+    "low_high_band_ratio": {
+      "status": "PASS",
+      "details": {
+        "signals_tested": 3,
+        "ordered_correctly": "True"
+      },
+      "metrics": {
+        "bass_ratio": 21615125643070.414,
+        "treble_ratio": 1.1423349124721548e-05,
+        "difference": 1.892188132138288e+18
+      }
+    },
+    "comprehensive_noise_dynamics": {
+      "status": "PASS",
+      "details": {
+        "signals_tested": 6,
+        "features_tested": 4
+      },
+      "metrics": {}
+    },
+    "pulse_clarity": {
+      "status": "PASS",
+      "details": {
+        "signals_tested": 4,
+        "validation": "regular > irregular clarity"
+      },
+      "metrics": {
+        "regular_clarity": 0.7137014175674027,
+        "irregular_clarity": 0.28143390836382826,
+        "sustained_clarity": 0.42664216868640664
+      }
+    },
+    "beat_periodicity": {
+      "status": "PASS",
+      "details": {
+        "signals_tested": 3,
+        "validation": "regular > random periodicity"
+      },
+      "metrics": {
+        "regular_periodicity": 0.8874179674486451,
+        "random_periodicity": 0.8559120589784236
+      }
+    },
+    "transient_counts": {
+      "status": "PASS",
+      "details": {
+        "signals_tested": 4,
+        "correct_counts": 4,
+        "results": [
+          {
+            "name": "many_transients",
+            "count": 23,
+            "rate": 7.619441105769231,
+            "expected_range": [
+              15,
+              30
+            ],
+            "valid": true
+          },
+          {
+            "name": "few_transients",
+            "count": 6,
+            "rate": 1.9876802884615383,
+            "expected_range": [
+              3,
+              8
+            ],
+            "valid": true
+          },
+          {
+            "name": "sustained",
+            "count": 1,
+            "rate": 0.3312800480769231,
+            "expected_range": [
+              0,
+              3
+            ],
+            "valid": true
+          },
+          {
+            "name": "crescendo",
+            "count": 1,
+            "rate": 0.3312800480769231,
+            "expected_range": [
+              0,
+              4
+            ],
+            "valid": true
+          }
+        ]
+      },
+      "metrics": {
+        "accuracy": 1.0,
+        "many_count": 23,
+        "few_count": 6
+      }
+    },
+    "percussive_spectral_slope": {
+      "status": "PASS",
+      "details": {
+        "signals_tested": 3,
+        "note": "Slope values computed on transient frames"
+      },
+      "metrics": {
+        "bass_percussion": -0.0009240375427141668,
+        "treble_percussion": -0.0005478861278959278,
+        "broadband_percussion": 2.2367574325330188e-05
+      }
+    },
+    "comprehensive_rhythmic": {
+      "status": "PASS",
+      "details": {
+        "signals_tested": 3,
+        "features_tested": 5
+      },
+      "metrics": {}
+    },
+    "phase": {
+      "status": "PASS",
+      "details": {
+        "signals_tested": 2,
+        "note": "Phase unwrapped correctly"
+      },
+      "metrics": {}
+    },
+    "group_delay": {
+      "status": "PASS",
+      "details": {
+        "signals_tested": 3,
+        "note": "Group delay computed"
+      },
+      "metrics": {
+        "pure_tone": {
+          "mean": -0.0028921044397998085,
+          "std": 0.0002696286942461355
+        },
+        "am_signal": {
+          "mean": -0.0027382075640506377,
+          "std": 0.0008222072745120317
+        },
+        "chirp": {
+          "mean": 0.00035478712560363607,
+          "std": 0.0009098406352104539
+        }
+      }
+    },
+    "instantaneous_frequency": {
+      "status": "PASS",
+      "details": {
+        "signals_tested": 4,
+        "tones_tested": 3,
+        "implementation": "Phase vocoder bin offset method"
+      },
+      "metrics": {
+        "avg_error": 0.016666972109324735,
+        "results": [
+          {
+            "name": "440hz_tone",
+            "expected": 440,
+            "actual": 440.01594889717876,
+            "error": 0.01594889717875958,
+            "bin_used": "41",
+            "bin_freq": 441.4306640625
+          },
+          {
+            "name": "1000hz_tone",
+            "expected": 1000,
+            "actual": 1000.0149154852635,
+            "error": 0.014915485263486516,
+            "bin_used": "93",
+            "bin_freq": 1001.2939453125
+          },
+          {
+            "name": "between_bins",
+            "expected": 450.5,
+            "actual": 450.5191365338857,
+            "error": 0.019136533885728113,
+            "bin_used": "42",
+            "bin_freq": 452.197265625
+          }
+        ]
+      }
+    },
+    "phase_congruency": {
+      "status": "PASS",
+      "details": {
+        "signals_tested": 4,
+        "validation": "tonal > noise congruency"
+      },
+      "metrics": {
+        "tone_congruency": 0.2960998317008965,
+        "noise_congruency": 0.008437859980464658,
+        "ratio": 35.09181621719573
+      }
+    },
+    "phase_coherence_time": {
+      "status": "PASS",
+      "details": {
+        "signals_tested": 3,
+        "note": "Phase coherence over time"
+      },
+      "metrics": {
+        "stable_tone": {
+          "mean": 0.7443526629987884,
+          "max": 0.9999072821616651,
+          "std": 0.13690872594841585
+        },
+        "frequency_modulated": {
+          "mean": 0.18122585578101807,
+          "max": 0.6938214805455724,
+          "std": 0.15514893665803378
+        },
+        "white_noise": {
+          "mean": 0.561952445229303,
+          "max": 0.7576733893955411,
+          "std": 0.0546387926438525
+        }
+      }
+    },
+    "phase_coherence_channels": {
+      "status": "PASS",
+      "details": {
+        "pairs_tested": 3,
+        "ordered_correctly": true
+      },
+      "metrics": {
+        "identical": 1.0,
+        "phase_shifted": 0.8312221200928652,
+        "different": 0.00012374027344816963
+      }
+    },
+    "comprehensive_phase": {
+      "status": "PASS",
+      "details": {
+        "signals_tested": 4,
+        "features_tested": 5
+      },
+      "metrics": {}
+    },
+    "sub_band_energy": {
+      "status": "PASS",
+      "details": {
+        "signals_tested": 4,
+        "n_bands": 8,
+        "results": [
+          {
+            "name": "low_freq",
+            "dominant_band": "0",
+            "band_freq": "0-1378 Hz",
+            "energy_distribution": "[1.32312329e+05 8.60032365e-02 9.30149880e-03 2.63398902e-03\n 1.16000194e-03 6.74926777e-04 4.83303981e-04 4.14885533e-04]"
+          },
+          {
+            "name": "mid_freq",
+            "dominant_band": "0",
+            "band_freq": "0-1378 Hz",
+            "energy_distribution": "[9.72114181e+04 2.42980958e+04 1.08008412e+04 4.38869905e-01\n 1.46461290e-01 7.70232296e-02 5.27033440e-02 4.44125977e-02]"
+          },
+          {
+            "name": "high_freq",
+            "dominant_band": "3",
+            "band_freq": "4134-5512 Hz",
+            "energy_distribution": "[1.64982534e+00 2.30582409e+00 5.65011814e+00 9.72049193e+04\n 9.71975547e+04 9.72041398e+04 4.98930361e+00 3.01489671e+00]"
+          },
+          {
+            "name": "broadband",
+            "dominant_band": "0",
+            "band_freq": "0-1378 Hz",
+            "energy_distribution": "[1003.31351413  961.7553166   989.69559083  977.18084784  971.14889704\n  975.92862463  954.8423337   997.66396486]"
+          }
+        ]
+      },
+      "metrics": {}
+    },
+    "sub_band_energy_ratios": {
+      "status": "PASS",
+      "details": {
+        "signals_tested": 3,
+        "n_bands": 8,
+        "validation": "sum of ratios \u2248 1.0"
+      },
+      "metrics": {}
+    },
+    "sub_band_entropy": {
+      "status": "PASS",
+      "details": {
+        "signals_tested": 4,
+        "n_bands": 8,
+        "ordered_correctly": "True"
+      },
+      "metrics": {
+        "single_tone_entropy": 0.0001693680559992603,
+        "noise_entropy": 0.9968038347365726
+      }
+    },
+    "sub_band_centroid": {
+      "status": "PASS",
+      "details": {
+        "signals_tested": 3,
+        "n_bands": 8,
+        "ordered_correctly": "True"
+      },
+      "metrics": {
+        "bass": 689.0647213678677,
+        "mid": 1167.1672167986749,
+        "treble": 6201.509929396507
+      }
+    },
+    "sub_band_flatness": {
+      "status": "PASS",
+      "details": {
+        "signals_tested": 3,
+        "n_bands": 8,
+        "ordered_correctly": "True"
+      },
+      "metrics": {
+        "single_band": 1.6866637459932395e-05,
+        "few_bands": 0.0007447887114676722,
+        "white_noise": 0.9931325152496777
+      }
+    },
+    "sub_band_ratio": {
+      "status": "PASS",
+      "details": {
+        "n_bands": 8,
+        "ratios_tested": 3
+      },
+      "metrics": {}
+    },
+    "sub_band_low_high_ratio": {
+      "status": "PASS",
+      "details": {
+        "signals_tested": 3,
+        "n_bands": 8,
+        "split_band": 4,
+        "ordered_correctly": "True"
+      },
+      "metrics": {
+        "bass_heavy": 949082591104841.6,
+        "balanced": 2.999990179643919,
+        "treble_heavy": 0.33342420435262365
+      }
+    },
+    "comprehensive_sub_band": {
+      "status": "PASS",
+      "details": {
+        "signals_tested": 4,
+        "n_bands": 8,
+        "features_tested": 4
+      },
+      "metrics": {}
+    }
+  },
+  "summary": {
+    "total_tests": 43,
+    "passed": 39,
+    "failed": 0,
+    "warnings": 4
+  }
+}

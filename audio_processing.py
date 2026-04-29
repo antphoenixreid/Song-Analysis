@@ -2,6 +2,7 @@ import os
 import numpy as np
 import librosa
 from scipy.signal import find_peaks
+from scipy.ndimage import maximum_filter
 from typing import Tuple, Optional, Dict
 
 # ---------- Utilities ----------
@@ -3105,3 +3106,2903 @@ class FrequencyFeatures():
 
         self._cache_freq[key] = ratio
         return ratio
+    
+# Chromagram class
+class ChromagramFeatures():
+    def __init__(self, sig: AudioSignal):
+        self.sig = sig
+        self.y = sig.y
+        self.sr = sig.sr
+        self.N = sig.N
+        self.H = sig.H
+
+        self.X = librosa.stft(
+            self.y,
+            n_fft=self.N,
+            hop_length=self.H,
+            win_length=self.N,
+            window="hann",
+            center=True
+        )
+        self.X_mag = np.abs(self.X)
+        self.freqs = librosa.fft_frequencies(sr=self.sr, n_fft=self.N)
+
+        self._cache_chroma = {}
+
+    @staticmethod
+    def midi_to_hz(midi, pitch_ref=69, freq_ref=440.0):
+        return (2.0**((midi - pitch_ref)/12.0))*freq_ref
+    
+    @staticmethod
+    def hz_to_midi(hz, pitch_ref=69, freq_ref=440.0):
+        return 12.0*np.log2(hz/freq_ref) + pitch_ref
+    
+    def _pitch_bin_edges(self, midi, pitch_ref=69, freq_ref=440.0):
+        lower = self.midi_to_hz(midi - 0.5, pitch_ref=pitch_ref, freq_ref=freq_ref)
+        upper = self.midi_to_hz(midi + 0.5, pitch_ref=pitch_ref, freq_ref=freq_ref)
+        return lower, upper
+    
+    def _pool_pitch(self, midi):
+        lower, upper = self._pitch_bin_edges(midi)
+        mask = (self.freqs >= lower) & (self.freqs < upper)
+        
+        return np.where(mask)[0]
+    
+    def _compute_spec_log_freq(self, n_pitches=128):
+        Y_LF = np.zeros((n_pitches, self.X_mag.shape[1]), dtype=float)
+        for p in range(n_pitches):
+            k = self._pool_pitch(p)
+            if k.size > 0:
+                Y_LF[p] = self.X_mag[k, :].sum(axis=0)
+
+        return Y_LF, np.arange(n_pitches)
+    
+    def _compute_chromagram(self, X_LF):
+        chroma = np.zeros((12, X_LF.shape[1]), dtype=float)
+        p = np.arange(X_LF.shape[0])
+
+        for c in range(12):
+            mask = (p%12) == c
+            chroma[c, :] = X_LF[mask, :].sum(axis=0)
+
+        return chroma
+    
+    def _chroma(self):
+        key = "chroma"
+        if key in self._cache_chroma:
+            return self._cache_chroma[key]
+        
+        Y_LF, F_coef_pitch = self._compute_spec_log_freq()
+        C = self._compute_chromagram(Y_LF)
+        self._cache_chroma[key] = C
+        self._cache_chroma["chroma_freqs"] = F_coef_pitch
+        self._cache_chroma["Y_LF"] = Y_LF
+        
+        return C
+    
+    def _chroma_db(self):
+        key = "chroma_db"
+        if key in self._cache_chroma:
+            return self._cache_chroma[key]
+        
+        C = self._chroma()
+        C_db = 10.0*np.log10(C + EPS)
+
+        self._cache_chroma[key] = C_db
+        return C_db
+    
+    def _normalize_chroma(self, C):
+        S = np.sum(C, axis=0, keepdims=True) + EPS
+        return C/S
+    
+    def _chroma_profile(self, normalize=True, use_db=False):
+        C = self._chroma_db() if use_db else self._chroma()
+        if normalize:
+            C = self._normalize_chroma(C)
+
+        return C
+
+    def _mean_chroma(self, normalize=True, use_db=False):
+        key = f"mean_chroma_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}"
+        if key in self._cache_chroma:
+            return self._cache_chroma[key]
+
+        C = self._chroma_profile(normalize=normalize, use_db=use_db)
+        mean_chroma = np.mean(C, axis=1)
+
+        self._cache_chroma[key] = mean_chroma
+        return mean_chroma
+    
+    def _chord_templates(self):
+        """
+        Generate chord templates for common chord types
+        """
+        key = "chord_templates"
+        if key in self._cache_chroma:
+            return self._cache_chroma[key]
+        
+        # Define chord types (intervals from root)
+        chord_types = {
+            'maj': [0, 4, 7],           # Major triad
+            'min': [0, 3, 7],           # Minor triad
+            '7': [0, 4, 7, 10],         # Dominant 7th
+            'maj7': [0, 4, 7, 11],      # Major 7th
+            'min7': [0, 3, 7, 10],      # Minor 7th
+            'dim': [0, 3, 6],           # Diminished
+            'aug': [0, 4, 8],           # Augmented
+            'sus4': [0, 5, 7],          # Suspended 4th
+            'sus2': [0, 2, 7],          # Suspended 2nd
+        }
+        
+        templates = []
+        labels = []
+        roots = []
+        qualities = []
+        
+        # Generate templates for all 12 roots × all chord types
+        for root in range(12):
+            for quality, intervals in chord_types.items():
+                # Create chroma vector
+                chroma = np.zeros(12, dtype=float)
+                for interval in intervals:
+                    chroma[(root + interval) % 12] = 1.0
+                
+                # Normalize
+                chroma = chroma / (np.sum(chroma) + EPS)
+                
+                templates.append(chroma)
+                labels.append(f"{root}:{quality}")
+                roots.append(root)
+                qualities.append(quality)
+        
+        templates = np.array(templates, dtype=float)
+        
+        result = {
+            'templates': templates,
+            'labels': labels,
+            'roots': roots,
+            'qualities': qualities
+        }
+        
+        self._cache_chroma[key] = result
+        return result
+    
+    def _pitch_class_profile(self, normalize=True, use_db=False):
+        return self._chroma_profile(normalize=normalize, use_db=use_db)
+    
+    def _pitch_class_deviation(self, normalize=True, use_db=False):
+        key = f"pitch_class_deviation_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}"
+        if key in self._cache_chroma:
+            return self._cache_chroma[key]
+
+        P = self._pitch_class_profile(normalize=normalize, use_db=use_db)
+        c_star = np.argmax(P, axis=0)
+        idx = np.arange(12)[:, None]
+        dist = np.minimum(np.abs(idx - c_star[None, :]), 12 - np.abs(idx - c_star[None, :]))
+        dev = np.sum((dist**2)*P, axis=0)
+
+        self._cache_chroma[key] = dev
+        return dev
+    
+    def _chroma_centroid(self, normalize=True, use_db=False):
+        """
+        Circular centroid of chroma distribution per frame
+
+        Formula:
+            x_t = sum(c*p_c)/sum(p_c) for c in [0..11]
+            y_t = sum(sin(2*pi*c/12)*p_c)/sum(p_c)
+            mu_t = atan2(y_t, x_t) in radians, then converted to [0, 12) in pitch classes
+        """
+        key = f"chroma_centroid_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}"
+        if key in self._cache_chroma:
+            return self._cache_chroma[key]
+
+        P = self._chroma_profile(normalize=normalize, use_db=use_db)
+        theta = 2.0*np.pi*np.arange(12)/12.0
+        x = np.sum(P*np.cos(theta)[:, None], axis=0)
+        y = np.sum(P*np.sin(theta)[:, None], axis=0)
+        mu = np.arctan2(y, x)
+
+        self._cache_chroma[key] = mu
+        return mu
+    
+    def _chroma_spread(self, normalize=True, use_db=False):
+        """
+        Circular spread of chroma distribution per frame
+
+        Formula:
+            mu_t = chroma centroid in radians
+            spread_t = sqrt(sum(p_c*(theta_c - mu_t)^2)/sum(p_c)) where theta_c is angle of chroma bin c
+        """
+        key = f"chroma_spread_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}"
+        if key in self._cache_chroma:
+            return self._cache_chroma[key]
+
+        P = self._chroma_profile(normalize=normalize, use_db=use_db)
+        mu = self._chroma_centroid(normalize=normalize, use_db=use_db)
+
+        # Map mu to fractional chroma [0, 12)
+        centroid_idx = (12.0*mu/(2.0*np.pi))%12.0
+
+        idx = np.arange(12)[:, None]
+        dist = np.minimum(np.abs(idx - centroid_idx[None, :]), 12 - np.abs(idx - centroid_idx[None, :]))
+        spread = np.sqrt(np.sum((dist**2)*P, axis=0))
+
+        self._cache_chroma[key] = spread
+        return spread
+
+    def _chroma_skewness(self, normalize=True, use_db=False):
+        """
+        Circular skewness of chroma distribution per frame
+
+        Formula:
+            mu_t = chroma centroid in radians
+            skew_t = sum(p_c*sin(2*(theta_c - mu_t)))/sum(p_c)
+        """
+        key = f"chroma_skewness_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}"
+        if key in self._cache_chroma:
+            return self._cache_chroma[key]
+
+        P = self._chroma_profile(normalize=normalize, use_db=use_db)
+        mu = self._chroma_centroid(normalize=normalize, use_db=use_db)
+        centroid_idx = (12.0*mu/(2.0*np.pi))%12.0
+
+        idx = np.arange(12)[:, None]
+        dist = np.minimum(np.abs(idx - centroid_idx[None, :]), 12 - np.abs(idx - centroid_idx[None, :]))
+
+        m2 = np.sum((dist**2)*P, axis=0)
+        m3 = np.sum((dist**3)*P, axis=0)
+
+        skew = m3/(np.power(m2, 1.5) + EPS)
+
+        
+        self._cache_chroma[key] = skew
+        return skew
+    
+    def _chroma_kurtosis(self, normalize=True, use_db=False, excess=True):
+        """
+        Circular kurtosis proxy around the chroma centroid per frame
+
+        Formula:
+            mu_t = chroma centroid in radians
+            kurt_t = sum(p_c*(theta_c - mu_t)^4)/sum(p_c) / (sum(p_c*(theta_c - mu_t)^2)/sum(p_c))^2
+        """
+        key = f"chroma_kurtosis_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}_{'excess' if excess else 'raw'}"
+        if key in self._cache_chroma:
+            return self._cache_chroma[key]
+
+        P = self._chroma_profile(normalize=normalize, use_db=use_db)
+        mu = self._chroma_centroid(normalize=normalize, use_db=use_db)
+        centroid_idx = (12.0*mu/(2.0*np.pi))%12.0
+
+        idx = np.arange(12)[:, None]
+        dist = np.minimum(np.abs(idx - centroid_idx[None, :]), 12 - np.abs(idx - centroid_idx[None, :]))
+
+        m2 = np.sum((dist**2)*P, axis=0)
+        m4 = np.sum((dist**4)*P, axis=0)
+
+        kurt = m4/(np.square(m2) + EPS)
+
+        if excess:
+            kurt = kurt - 3.0
+
+        self._cache_chroma[key] = kurt
+        return kurt
+    
+    def _chroma_template(self):
+        """
+        Returns simple major/minor chord templates for chroma matching
+        Output shape: (24, 12) array where rows correspond to major/minor templates for each root
+        Order of rows: C major, C minor, C# major, C# minor, ..., B major, B minor
+        """
+        key = "chroma_template"
+        if key in self._cache_chroma:
+            return self._cache_chroma[key]
+
+        # Krumhansl-Schmuckler major profile (C major)
+        major_profile = np.array([
+            6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 
+            2.52, 5.19, 2.39, 3.66, 2.29, 2.88
+        ])
+        
+        # Krumhansl-Schmuckler minor profile (C minor)
+        minor_profile = np.array([
+            6.33, 2.68, 3.52, 5.38, 2.60, 3.53,
+            2.54, 4.75, 3.98, 2.69, 3.34, 3.17
+        ])
+        
+        # Normalize profiles
+        major_profile = major_profile / np.sum(major_profile)
+        minor_profile = minor_profile / np.sum(minor_profile)
+        
+        # Create templates for all 24 keys by circular rotation
+        templates = np.zeros((24, 12), dtype=float)
+        
+        # Major keys (0-11)
+        for i in range(12):
+            templates[i] = np.roll(major_profile, i)
+        
+        # Minor keys (12-23)
+        for i in range(12):
+            templates[12 + i] = np.roll(minor_profile, i)
+        
+        self._cache_chroma[key] = templates
+        return templates
+    
+    def _template_labels(self):
+        names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+        labels = [f"{n}:maj" for n in names] + [f"{n}:min" for n in names]
+
+        return labels
+    
+    # Tonality/Chord
+    def _key_estimation(self, normalize=True, use_db=False, method="cosine"):
+        """
+        Estimate the key of the audio signal
+        Returns:
+            key_idx: index of estimated key in template_labels (0-23)
+            tonic: pitch class of tonic (0-11)
+            mode: "maj" or "min"
+            score: cosine similarity score of best matching template
+            scores: array of cosine similarity scores for all templates
+        """
+        key = f"key_estimation_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}_{method}"
+        if key in self._cache_chroma:
+            return self._cache_chroma[key]
+        
+        P = self._mean_chroma(normalize=normalize, use_db=use_db)
+        T = self._chroma_template()
+
+        if method == "cosine":
+            Pn = P/(np.linalg.norm(P) + EPS)
+            Tn = T/(np.linalg.norm(T, axis=1, keepdims=True) + EPS)
+            scores = Tn @ Pn
+        elif method == "dot":
+            scores = T @ P
+        else:
+            raise ValueError(f"Unsupported method: {method}")
+        
+        key_idx = int(np.argmax(scores))
+        tonic = key_idx%12
+        mode = "maj" if key_idx < 12 else "min"
+        score = float(scores[key_idx])
+
+        result = {
+            "key_idx": key_idx,
+            "tonic": tonic,
+            "mode": mode,
+            "score": score,
+            "scores": scores
+        }
+
+        self._cache_chroma[key] = result
+        return result
+    
+    def _mode_classification(self, normalize=True, use_db=False, method="cosine"):
+        """
+        Classify the mode (major vs minor) of the audio signal
+        Returns:
+            mode string: "maj" or "min"
+            score_major: float score for best matching major template
+            score_minor: float score for best matching minor template
+            delta_score: score_major - score_minor, higher = more major-like, lower = more minor-like
+        """
+        key = f"mode_classification_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}_{method}"
+        if key in self._cache_chroma:
+            return self._cache_chroma[key]
+        
+        result = self._key_estimation(normalize=normalize, use_db=use_db, method=method)
+        tonic = result["tonic"]
+        score_major = result["scores"][tonic]
+        score_minor = result["scores"][tonic + 12]
+        delta_score = score_major - score_minor
+
+        mode = "maj" if delta_score >= 0 else "min"
+
+        result = {
+            "mode": mode,
+            "score_major": score_major,
+            "score_minor": score_minor,
+            "delta_score": delta_score
+        }
+
+        self._cache_chroma[key] = result
+        return result
+    
+    def _tonal_clarity(self, normalize=True, use_db=False, method="cosine"):
+        """
+        A simple tonal clarity measure based on the best key estimation score normalized by the mean score
+        """
+        key = f"tonal_clarity_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}_{method}"
+        if key in self._cache_chroma:
+            return self._cache_chroma[key]
+        
+        result = self._key_estimation(normalize=normalize, use_db=use_db, method=method)
+        scores = result["scores"]
+        s_sorted = np.sort(scores)
+        best = float(s_sorted[-1])
+        second = float(s_sorted[-2]) if len(s_sorted) > 1 else 0.0
+
+        margin = best - second
+        clarity = margin/(best + EPS)
+
+        result = {
+            "tonal_clarity": clarity,
+            "best_score": best,
+            "margin": margin
+        }
+
+        self._cache_chroma[key] = result
+        return result
+    
+    def _harmonic_entropy(self, normalize=True, use_db=False, method="cosine", beta=1.0):
+        """
+        Entropy of the key estimation scores across all templates, normalized by log(num_templates)
+        Higher values indicate a more ambiguous tonal center, while lower values indicate a clearer key
+        """
+        key = f"harmonic_entropy_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}_{method}_beta{beta}"
+        if key in self._cache_chroma:
+            return self._cache_chroma[key]
+        
+        result = self._key_estimation(normalize=normalize, use_db=use_db, method=method)
+        scores = result["scores"]
+
+        z = beta*(scores - np.max(scores))
+        p = np.exp(z)
+        p = p/(np.sum(p) + EPS)
+
+        H = -np.sum(p*np.log(p + EPS))
+        H_norm = H/np.log(len(scores) + EPS)
+
+        result = {
+            "harmonic_entropy": H_norm,
+            "raw_entropy": H,
+            "probabilities": p
+        }
+
+        self._cache_chroma[key] = result
+        return result
+    
+    def _consonance_dissonance(self, normalize=True, use_db=False, method="cosine"):
+        """
+        Consonance: average score of the best matching major/minor template
+        Dissonance: average score of the non-best templates (1 - consonance)
+        """
+        key = f"consonance_dissonance_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}_{method}"
+        if key in self._cache_chroma:
+            return self._cache_chroma[key]
+        
+        result = self._tonal_clarity(normalize=normalize, use_db=use_db, method=method)
+        best = result["best_score"]
+
+        consonance = safe_clip01(best)
+        dissonance = float(1.0 - consonance)
+
+        result = {
+            "consonance": consonance,
+            "dissonance": dissonance
+        }
+
+        self._cache_chroma[key] = result
+        return result
+    
+    # Harmonic Features
+    def _chord_detection(self, normalize=True, use_db=False, method="cosine"):
+        """
+        Detect chord per frame
+
+        Returns:
+            chord_idx: shape (T,)
+            chord_labels: list[str]
+            chord_scores: shape (T,)
+            all_scores: shape (24, T)
+        """
+        key = f"chord_detection_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}_{method}"
+        if key in self._cache_chroma:
+            return self._cache_chroma[key]
+        
+        C = self._chroma_profile(normalize=normalize, use_db=use_db)
+        templates = self._chord_templates()
+        TPL = templates['templates']
+        labels = templates['labels']
+        roots = np.asarray(templates['roots'])
+        qualities = np.asarray(templates['qualities'])
+
+        if method == "cosine":
+            Cn = C/(np.linalg.norm(C, axis=0, keepdims=True) + EPS)
+            Tn = TPL/(np.linalg.norm(TPL, axis=1, keepdims=True) + EPS)
+            scores = Tn @ Cn
+        elif method == "dot":
+            scores = TPL @ C
+        else:
+            raise ValueError("method must be 'cosine' or 'dot'")
+        
+        chord_idx = np.argmax(scores, axis=0)
+        best_scores = scores[chord_idx, np.arange(scores.shape[1])]
+        chord_labels = [labels[i] for i in chord_idx]
+
+        result = {
+            "chord_idx": chord_idx,
+            "chord_labels": chord_labels,
+            "scores": scores,
+            "best_scores": best_scores,
+            "roots": roots[chord_idx],
+            "qualities": qualities[chord_idx]
+        }
+
+        self._cache_chroma[key] = result
+        return result
+    
+    def _chord_progression_mapping(self, normalize=True, use_db=False, method="cosine"):
+        """
+        Sequence of chord labels plus transition counts/probabilities
+        """
+        key = f"chord_progression_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}_{method}"
+        if key in self._cache_chroma:
+            return self._cache_chroma[key]
+        
+        det = self._chord_detection(normalize=normalize, use_db=use_db, method=method)
+        chord_labels = det["chord_labels"]
+
+        if len(chord_labels) == 0:
+            result = {
+                "labels": [],
+                "transition_counts": np.zeros((0, 0), dtype=float),
+                "transition_probs": np.zeros((0, 0), dtype=float)
+            }
+            self._cache_chroma[key] = result
+            return result
+        
+        uniq = sorted(set(chord_labels))
+        idx_map = {lab: i for i, lab in enumerate(uniq)}
+        n = len(uniq)
+
+        counts = np.zeros((n, n), dtype=float)
+        for a, b in zip(chord_labels[:-1], chord_labels[1:]):
+            counts[idx_map[a], idx_map[b]] += 1.0
+
+        probs = counts/(np.sum(counts, axis=1, keepdims=True) + EPS)
+
+        result = {
+            "labels": uniq,
+            "transition_counts": counts,
+            "transition_probs": probs
+        }
+
+        self._cache_chroma[key] = result
+        return result
+    
+    def _harmonic_rhythm(self, normalize=True, use_db=False, method="cosine"):
+        """
+        Chord-change rae and average chord duration
+        """
+        key = f"harmonic_rhythm_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}_{method}"
+        if key in self._cache_chroma:
+            return self._cache_chroma[key]
+        
+        det = self._chord_detection(normalize=normalize, use_db=use_db, method=method)
+        labels = det["chord_labels"]
+
+        if len(labels) < 2:
+            result = {
+                "change_rate": 0.0,
+                "avg_duration_sec": 0.0,
+                "durations_sec": np.array({}, dtype=float),
+                "num_changes": 0
+            }
+
+            self._cache_chroma[key] = result
+            return result
+        
+        changes = np.where(np.array(labels[1:]) != np.array(labels[:-1]))[0] + 1
+        boundaries = np.concatenate([[0], changes, [len(labels)]])
+        frame_durations = np.diff(boundaries)
+
+        sec_per_frame = self.H/float(self.sr)
+        durations_sec = frame_durations*sec_per_frame
+
+        num_changes = int(len(boundaries) - 2)
+        total_sec = len(labels)*sec_per_frame
+        change_rate = num_changes/(total_sec + EPS)
+        avg_duration_sec = float(np.mean(durations_sec)) if durations_sec.size > 0 else 0.0
+
+        result = {
+            "change_rate": change_rate,
+            "avg_duration_sec": avg_duration_sec,
+            "durations_sec": durations_sec,
+            "num_changes": num_changes,
+            "boundaries": boundaries
+        }
+
+        self._cache_chroma[key] = result
+        return result
+    
+    def _root_motion_analysis(self, normalize=True, use_db=False, method="cosine"):
+        """
+        Analyze root movement between successive detected chords
+        Returns root interval histogram and average circular motion
+        """
+        key = f"root_motion_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}_{method}"
+        if key in self._cache_chroma:
+            return self._cache_chroma[key]
+        
+        det = self._chord_detection(normalize=normalize, use_db=use_db, method=method)
+        roots = np.asarray(det["roots"], dtype=int)
+
+        if roots.size < 2:
+            result = {
+                "intervals": np.array([], dtype=int),
+                "histogram": np.zeros(12, dtype=float),
+                "avg_motion": 0.0
+            }
+
+            self._cache_chroma[key] = result
+            return result
+        
+        intervals = (roots[1:] - roots[:-1])%12
+        hist = np.bincount(intervals, minlength=12).astype(float)
+        hist = hist/(np.sum(hist) + EPS)
+
+        circular_motion = np.minimum(intervals, 12 - intervals)
+        avg_motion = float(np.mean(circular_motion))
+
+        result = {
+            "intervals": intervals,
+            "histogram": hist,
+            "avg_motion": avg_motion
+        }
+
+        self._cache_chroma[key] = result
+        return result
+    
+    def _tonal_stability_index(self, normalize=True, use_db=False, method="cosine"):
+        """
+        Tonal stability index with proper scaling
+        """
+        key = f"tonal_stability_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}_{method}"
+        if key in self._cache_chroma:
+            return self._cache_chroma[key]
+        
+        det = self._chord_detection(normalize=normalize, use_db=use_db, method=method)
+        best_scores = np.asarray(det["best_scores"], dtype=float)
+        labels = np.asarray(det["chord_labels"])
+
+        if best_scores.size == 0:
+            self._cache_chroma[key] = 0.0
+            return 0.0
+        
+        # Component 1: Confidence
+        mean_score = float(np.mean(best_scores))
+        confidence = (mean_score - 0.55) / 0.43
+        confidence = float(np.clip(confidence, 0.0, 1.0))
+        
+        # Component 2: Persistence (exponential scaling)
+        if labels.size < 2:
+            persistence_raw = 1.0
+        else:
+            persistence_raw = float(np.mean(labels[1:] == labels[:-1]))
+        
+        if persistence_raw < 0.5:
+            persistence = 0.0
+        else:
+            normalized = (persistence_raw - 0.5) / 0.5
+            persistence = float(normalized ** 3)
+        
+        # Component 3: Transition diversity (FIXED)
+        prog = self._chord_progression_mapping(normalize=normalize, use_db=use_db, method=method)
+        counts = prog["transition_counts"]
+        
+        if counts.size == 0:
+            predictability = 1.0
+        else:
+            # Count unique transitions
+            num_transitions = int(np.sum(counts > 0))
+            num_chords = counts.shape[0]
+            
+            # Normalize by number of chords
+            # Few chords with few transitions = high predictability
+            # Many chords with many transitions = low predictability
+            transition_density = num_transitions / (num_chords + EPS)
+            predictability = 1.0 / (1.0 + transition_density)
+            predictability = float(np.clip(predictability, 0.0, 1.0))
+        
+        # Combined TSI
+        tsi = 0.5 * persistence + 0.3 * confidence + 0.2 * predictability
+        tsi = float(np.clip(tsi, 0.0, 1.0))
+        
+        self._cache_chroma[key] = tsi
+        return tsi
+    
+    # Temporal Chroma Features
+    def _chroma_autocorrelation(self, lag_max=64, normalize=True, use_db=False):
+        """
+        Autocorrelation of chroma over time
+
+        Returns:
+            acf: shape (12, lag_max + 1)
+            acf_mean: shape (lag_max + 1,)
+        """
+        key = f"chroma_autocorr_{lag_max}_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}"
+        if key in self._cache_chroma:
+            return self._cache_chroma[key]
+        
+        P = self._chroma_profile(normalize=normalize, use_db=use_db)
+        T = P.shape[1]
+        lag_max = int(min(lag_max, max(0, T - 1)))
+
+        acf = np.zeros((12, lag_max + 1), dtype=float)
+        for c in range(12):
+            x = P[c] - np.mean(P[c])
+            den = np.sum(x*x) + EPS
+            for tau in range(lag_max + 1):
+                if tau == 0:
+                    acf[c, tau] = 1.0
+                else:
+                    acf[c, tau] = np.sum(x[:-tau]*x[tau:])/den
+
+        acf_mean = np.mean(acf, axis=0)
+
+        result = {
+            "acf": acf,
+            "acf_mean": acf_mean
+        }
+
+        self._cache_chroma[key] = result
+        return result
+    
+    def _chroma_variability(self, normalize=True, use_db=False):
+        """
+        Variability of each chroma bin over time
+        """
+        key = f"chroma_variability_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}"
+        if key in self._cache_chroma:
+            return self._cache_chroma[key]
+        
+        P = self._chroma_profile(normalize=normalize, use_db=use_db)
+        mu = np.mean(P, axis=1, keepdims=True)
+        sigma = np.sqrt(np.mean((P - mu)**2, axis=1))
+
+        result = {
+            "per_bin_std": sigma,
+            "mean_variability": float(np.mean(sigma)),
+            "median_variability": float(np.median(sigma))
+        }
+
+        self._cache_chroma[key] = result
+        return result
+        
+    def _chroma_smoothness(self, normalize=True, use_db=False, metric="l2"):
+        """
+        Smoothness based on frame-to-frame chroma differences
+        """
+        key = f"chroma_smoothness_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}_{metric}"
+        if key in self._cache_chroma:
+            return self._cache_chroma[key]
+        
+        P = self._chroma_profile(normalize=normalize, use_db=use_db)
+
+        if P.shape[1] < 2:
+            result = {
+                "smoothness": 1.0,
+                "mean_diff": 0.0,
+                "diffs": np.array([], dtype=float)
+            }
+
+            self._cache_chroma[key] = result
+            return result
+        
+        diffs = np.diff(P, axis=1)
+
+        if metric == "l1":
+            d = np.sum(np.abs(diffs), axis=0)
+            d /= 2.0
+            smooth = 1.0 - float(np.mean(d))
+        elif metric == "l2":
+            d = np.linalg.norm(diffs, axis=0)
+            smooth = float(np.exp(-np.mean(d)))
+        else:
+            raise ValueError("metric must 'l1' or 'l2'")
+        
+        result = {
+            "smoothness": safe_clip01(smooth),
+            "mean_diff": float(np.mean(d)),
+            "diffs": d
+        }
+
+        self._cache_chroma[key] = result
+        return result
+    
+    def _dominant_pitch_track(self, normalize=True, use_db=False):
+        """
+        Dominant chroma bin per frame
+        """
+        key = f"dominant_pitch_track_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}"
+        if key in self._cache_chroma:
+            return self._cache_chroma[key]
+        
+        P = self._chroma_profile(normalize=normalize, use_db=use_db)
+        dom = np.argmax(P, axis=0)
+
+        self._cache_chroma[key] = dom
+        return dom
+    
+    def _tuning_deviation_detection(self, top_k=20):
+        """
+        Estimate cents drift from equal temperament using dominant spectral peaks
+
+        Returns:
+            cents_per_peak: (top_k,)
+            track_cents: scalar median drift
+        """
+        key = f"tuning_deviation_{top_k}"
+        if key in self._cache_chroma:
+            return self._cache_chroma[key]
+        
+        mag = self.X_mag
+        if mag.size == 0:
+            result = {
+                "cents_per_peak": np.array([], dtype=float),
+                "track_cents": 0.0
+            }
+            self._cache_chroma[key] = result
+            return result
+        
+        peak_bins = np.argsort(np.mean(mag, axis=1))[-int(top_k):]
+        peak_freqs = self.freqs[peak_bins]
+        peak_freqs = peak_freqs[peak_freqs > 0]
+
+        if peak_freqs.size == 0:
+            result = {
+                "cents_per_peak": np.array([], dtype=float),
+                "track_cents": 0.0
+            }
+            self._cache_chroma[key] = result
+            return result
+        
+        midi = self.hz_to_midi(peak_freqs)
+        nearest = np.round(midi)
+        cents = 100.0*(midi - nearest)
+
+        result = {
+            "cents_per_peak": cents,
+            "track_cents": float(np.median(cents)),
+            "mean_abs_cents": float(np.mean(np.abs(cents)))
+        }
+
+        self._cache_chroma[key] = result
+        return result
+
+
+class TempogramFeatures:
+    def __init__(self, sig, center=True):
+        self.y = sig.y
+        self.sr = sig.sr
+        self.H = sig.H
+        self.N = sig.N
+        self.center = center
+
+        self._cache_tempogram = {}
+
+        # Frame Rate
+        self.frame_rate = float(self.sr)/float(self.H)
+
+        # Time vector for frames
+        self.times = None # Will not be set when onset strength is computed
+
+    def _get_filtered_spectrum(self, S, bpm, bpm_min=30, bpm_max=300):
+        """
+        Internal helper to filter the tempogram spectrum to a reasonable BPM range and apply logarithmic scaling
+        """
+        mask = (bpm >= bpm_min) & (bpm <= bpm_max) & np.isfinite(S)
+        return S[mask], bpm[mask]
+
+    # Onset Strength Envelope
+    def _onset_strength(self, max_size=1, detrend=False, aggregate=np.mean, smooth=False, smooth_width=5):
+        key = f"onset_strength_max_{max_size}_detrend_{detrend}_{aggregate.__name__}_{smooth}_{smooth_width}"
+        if key in self._cache_tempogram:
+            return self._cache_tempogram[key]
+        
+        onset_env = librosa.onset.onset_strength(
+            y=self.y,
+            sr=self.sr,
+            hop_length=self.H,
+            n_fft=self.N,
+            aggregate=aggregate
+        )
+
+        if max_size > 1:
+            onset_env = maximum_filter(onset_env, size=max_size, mode="constant")
+
+        if detrend and onset_env.size > 1:
+            x = np.arange(onset_env.size, dtype=float)
+            p = np.polyfit(x, onset_env, deg=1)
+            onset_env = onset_env - np.polyval(p, x)
+
+        onset_env = np.maximum(onset_env, 0.0)
+
+        if smooth and smooth_width > 1:
+            kernel = np.ones(int(smooth_width), dtype=float)/float(smooth_width)
+            onset_env = np.convolve(onset_env, kernel, mode='same')
+            onset_env = np.maximum(onset_env, 0.0)
+
+        times = librosa.frames_to_time(np.arange(len(onset_env)), sr=self.sr, hop_length=self.H)
+
+        result = {
+            'onset_env': onset_env,
+            'times': times
+        }
+
+        self._cache_tempogram[key] = result
+        return result
+    
+    def _onset_energy(self, normalize=False, max_size=1, detrend=False):
+        """
+        Total or average onset energy 
+        """
+        key = f"onset_energy_{normalize}_{max_size}_{detrend}"
+        if key in self._cache_tempogram:
+            return self._cache_tempogram[key]
+        
+        onset = self._onset_strength(max_size=max_size, detrend=detrend)['onset_env']
+        energy = float(np.mean(onset) if normalize else np.sum(onset))
+
+        self._cache_tempogram[key] = energy
+        return energy
+    
+    def _transient_curve(self, smooth=False, smooth_width=5, normalize=True):
+        """
+        Transient curve from first differences of the onset envelope
+        """
+        key = f"transient_curve_{smooth}_{smooth_width}_{normalize}"
+        if key in self._cache_tempogram:
+            return self._cache_tempogram[key]
+        
+        onset = self._onset_strength()['onset_env']
+
+        if onset.size < 2:
+            result = {
+                "curve": np.array([], dtype=float),
+                "peak_count": 0,
+                "mean_slope": 0.0
+            }
+
+            self._cache_tempogram[key] = result
+            return result
+        
+        curve = np.maximum(0.0, np.diff(onset))
+
+        if smooth and smooth_width > 1:
+            kernel = np.ones(smooth_width, dtype=float)/float(smooth_width)
+            curve = np.convolve(curve, kernel, mode="same")
+
+        if normalize:
+            curve = curve/(np.max(curve) + EPS)
+
+        peaks = np.where((curve[1:-1] > curve[:-2]) & (curve[1:-1] >= curve[2:]))[0] + 1
+
+        result = {
+            "curve": curve,
+            "peak_count": int(peaks.size),
+            "mean_slope": float(np.mean(curve)) if curve.size > 0 else 0.0,
+            "peaks": peaks 
+        }
+
+        self._cache_tempogram[key] = result
+        return result 
+    
+    def _envelope_periodicity(self, lag_max=None, normalize=True, method="autocorr"):
+        """
+        Periodicity of the onset envelope via autocorrelation or Fourier spectrum
+        """
+        key = f"envelope_periodicity_{lag_max}_{normalize}_{method}"
+        if key in self._cache_tempogram:
+            return self._cache_tempogram[key]
+        
+        onset = self._onset_strength()["onset_env"]
+        if onset.size < 3:
+            result = {
+                "periodicity": 0.0,
+                "acf": np.array([], dtype=float),
+                "bpm": np.array([], dtype=float),
+                "scores": np.array([], dtype=float)
+            }
+            self._cache_tempogram[key] = result
+            return result
+        
+        x = onset - np.mean(onset)
+        if lag_max is None:
+            lag_max = min(len(x) - 1, int(self.frame_rate*4.0))
+
+        lag_max = int(max(1, min(lag_max, len(x) - 1)))
+
+        if method == "autocorr":
+            acf = np.correlate(x, x, mode="full")[len(x) - 1:len(x) - 1 + lag_max + 1]
+            if normalize:
+                acf = acf/(acf[0] + EPS)
+
+            acf_pos = acf[1:] if acf.size > 1 else acf
+            best_lag = int(np.argmax(acf_pos) + 1) if acf_pos.size > 0 else 0
+            periodicity = float(np.max(acf_pos)) if acf_pos.size > 0 else 0.0
+
+            bpm = np.zeros_like(acf, dtype=float)
+            bpm[1:] = 60*self.frame_rate/np.arange(1, len(acf))
+            result = {
+                "periodicity": safe_clip01(periodicity),
+                "acf": acf,
+                "bpm": bpm,
+                "best_lag": best_lag
+            }
+        elif method == "fourier":
+            fft = np.fft.rfft(x*np.hanning(len(x)), n=len(x))
+            scores = np.abs(fft)
+            freqs = np.fft.rfftfreq(len(x), d=1.0/self.frame_rate)
+            bpm = 60.0*freqs
+
+            if scores.size > 1:
+                best_idx = int(np.argmax(scores[1:]) + 1)
+                periodicity = float(scores[best_idx]/(np.sum(scores) + EPS))
+            else:
+                best_idx = 0
+                periodicity = 0.0
+
+            result = {
+                "periodicity": safe_clip01(periodicity),
+                "scores": scores,
+                "bpm": bpm,
+                "best_idx": best_idx 
+            }
+        else:
+            raise ValueError("method must be 'autocorr' or 'fourier'")
+        
+        self._cache_tempogram[key] = result
+        return result
+    
+    # Autocorrelation Tempogram
+    # def _tempo_autocorr(self, win_length=None, center=None, norm='l1'):
+    #     if win_length is None:
+    #         win_length = self.N
+    #     if center is None:
+    #         center = self.center
+
+    #     key = f"tempogram_autocorr_win_{win_length}_center_{center}_norm_{norm}"
+    #     if key in self._cache_tempogram:
+    #         result = self._cache_tempogram[key]
+    #         return result
+        
+    #     # Get onset strength
+    #     onset_result = self._onset_strength()
+    #     onset_env = onset_result['onset_env']
+
+    #     n_frames = len(onset_env)
+
+    #     # Compute number of windows
+    #     if center:
+    #         n_windows = n_frames
+    #     else:
+    #         n_windows = n_frames - win_length + 1
+
+    #     if n_windows <= 0:
+    #         # Not enough frames
+    #         tempogram = np.zeros((win_length, 0), dtype=float)
+    #         bpm = np.zeros(win_length, dtype=float)
+    #         times = np.array([], dtype=float)
+
+    #         result = {
+    #             'tempogram': tempogram,
+    #             'bpm': bpm,
+    #             'times': times
+    #         }
+    #         self._cache_tempogram[key] = result
+    #         return result
+        
+    #     # Initialize tempogram
+    #     tempogram = np.zeros((win_length, n_windows), dtype=float)
+
+    #     # Compute autocorrelation for each window
+    #     for i in range(n_windows):
+    #         if center:
+    #             # Center window around frame i
+    #             start = max(0, i - win_length//2)
+    #             end = min(n_frames, i + win_length//2 + 1)
+    #         else:
+    #             # Sliding window
+    #             start = i
+    #             end = i + win_length
+
+    #         # Extract window
+    #         window = onset_env[start:end]
+
+    #         # Compute autocorrelation
+    #         if window.size < 2:
+    #             continue
+
+    #         window = window - np.mean(window)
+    #         acf = np.correlate(window, window, mode='full')[len(window) - 1:]
+
+    #         if norm == 'l1':
+    #             acf = acf/(np.sum(np.abs(acf)) + EPS)
+    #         elif norm == 'l2':
+    #             acf = acf/(np.linalg.norm(acf) + EPS)
+    #         elif norm is None:
+    #             pass
+    #         else:
+    #             acf = acf/(acf[0] + EPS)
+
+    #         tempogram[:min(win_length, len(acf)), i] = acf[:win_length]
+
+    #     # Compute BPM axis
+    #     # BPM = 60*frame_rate/lag
+    #     lags = np.arange(win_length)
+    #     bpm = np.zeros(win_length, dtype=float)
+    #     bpm[1:] = 60.0*self.frame_rate/lags[1:]
+
+    #     if center:
+    #         window_times = onset_result['times'][:n_windows]
+    #     else:
+    #         window_centers = np.arange(n_windows) + win_length//2
+    #         window_times = librosa.frames_to_time(window_centers, sr=self.sr, hop_length=self.H)
+
+    #     result = {
+    #         'tempogram': tempogram,
+    #         'bpm': bpm,
+    #         'times': window_times
+    #     }
+
+    #     self._cache_tempogram[key] = result
+    #     return result
+    
+    def _tempogram_autocorr(self, win_length=None, center=None, norm_sum=True):
+        if win_length is None:
+            win_length = self.N
+        if center is None:
+            center = self.center
+
+        key = f"tempogram_autocorr_win_{win_length}_center_{center}_norm_sum_{norm_sum}"
+        if key in self._cache_tempogram:
+            return self._cache_tempogram[key]
+        
+        onset = self._onset_strength()
+        onset_env = onset['onset_env']
+        times = onset['times']
+        n_frames = len(onset_env)
+
+        if center:
+            n_windows = n_frames
+        else:
+            n_windows = n_frames - win_length + 1
+
+        if n_windows <= 0:
+            tempogram = np.zeros((win_length, 0), dtype=float)
+            bpm = np.zeros(win_length, dtype=float)
+            windows_times = np.array([], dtype=float)
+
+            self._cache_tempogram[key] = {
+                'tempogram': tempogram,
+                'bpm': bpm,
+                'times': windows_times
+            }
+            return result
+        
+        tempogram = np.zeros((win_length, n_windows), dtype=float)
+
+        for n in range(n_windows):
+            if center:
+                start = max(0, n - win_length//2)
+                end = min(n_frames, n + win_length//2 + 1)
+            else:
+                start = n
+                end = n + win_length
+            
+            x = onset_env[start:end]
+            if x.size < 2:
+                continue
+
+            x = x - np.mean(x)
+            acf = np.correlate(x, x, mode='full')[len(x) - 1:]
+
+            if norm_sum:
+                acf = acf/(np.sum(acf) + EPS)
+            else:
+                acf = acf/(acf[0] + EPS)
+
+            tempogram[:min(win_length, len(acf)), n] = acf[:win_length]
+
+        lags = np.arange(win_length, dtype=float)
+        bpm = np.zeros(win_length, dtype=float)
+        bpm[1:] = 60.0*self.frame_rate/lags[1:]
+
+        if center:
+            windows_times = times[:n_windows]
+        else:
+            window_centers = np.arange(n_windows) + win_length//2
+            windows_times = librosa.frames_to_time(window_centers, sr=self.sr, hop_length=self.H)
+
+        result = {
+            'tempogram': tempogram,
+            'bpm': bpm,
+            'times': windows_times
+        }
+        
+        self._cache_tempogram[key] = result
+        return result
+        
+    def _global_bpm(self, bpm_min=40.0, bpm_max=240.0, norm_sum=True):
+        key = f"global_bpm_{bpm_min}_{bpm_max}_{norm_sum}"
+        if key in self._cache_tempogram:
+            return self._cache_tempogram[key]
+        
+        ac = self._tempogram_autocorr(norm_sum=norm_sum)
+        tg = ac['tempogram']
+        bpm = ac['bpm']
+
+        if tg.size == 0:
+            result = {
+                "bpm": 0.0,
+                "lag": 0,
+                "strength": 0.0,
+                "bpm_axis": bpm
+            }
+            self._cache_tempogram[key] = result
+            return result
+        
+        mask = (bpm >= bpm_min) & (bpm <= bpm_max) & np.isfinite(bpm)
+        if not np.any(mask):
+            result = {
+                "bpm": 0.0,
+                "lag": 0,
+                "strength": 0.0,
+                "bpm_axis": bpm
+            }
+            self._cache_tempogram[key] = result
+            return result
+        
+        global_ac = np.mean(tg, axis=1)
+
+        search = global_ac[mask]
+
+        idxs = np.where(mask)[0]
+        best_rel = int(np.argmax(search))
+        best_idx = int(idxs[best_rel])
+
+        detected_bpm = float(bpm[best_idx])
+        detected_strength = float(global_ac[best_idx])
+
+        if detected_bpm < 80:
+            for multiplier in [2, 3, 4]:
+                candidate_bpm = detected_bpm*multiplier
+
+                # Only consider if in valid range
+                if candidate_bpm > bpm_max:
+                    break
+
+                # Find closest bin
+                candidate_idx = np.argmin(np.abs(bpm - candidate_bpm))
+                candidate_strength = global_ac[candidate_idx]
+
+                # If octave multiple is at least 70% as strong, prefer it
+                if candidate_strength > 0.7*detected_strength:
+                    detected_bpm = float(bpm[candidate_idx])
+                    best_idx = int(candidate_idx)
+                    detected_strength = candidate_strength
+        elif detected_bpm > 200:
+            for divisor in [2, 3, 4]:
+                candidate_bpm = detected_bpm/divisor
+
+                if candidate_bpm < bpm_min:
+                    break
+
+                candidate_idx = np.argmin(np.abs(bpm - candidate_bpm))
+                candidate_strength = global_ac[candidate_idx]
+
+                # Prefer sub-octave if it's reasonably strong
+                if candidate_strength > detected_strength:
+                    detected_bpm = float(bpm[candidate_idx])
+                    best_idx = int(candidate_idx)
+                    detected_strength = candidate_strength
+                    break
+
+        result = {
+            "bpm": float(bpm[best_idx]),
+            "lag": int(best_idx),
+            "strength": float(global_ac[best_idx]),
+            "bpm_axis": bpm,
+            "global_ac":global_ac
+        }
+
+        self._cache_tempogram[key] = result
+        return result
+    
+    def _local_bpm_curve(self, bpm_min=40.0, bpm_max=240.0, norm_sum=True):
+        key = f"local_bpm_curve_{bpm_min}_{bpm_max}_{norm_sum}"
+        if key in self._cache_tempogram:
+            return self._cache_tempogram[key]
+        
+        ac = self._tempogram_autocorr(norm_sum=norm_sum)
+        tg = ac['tempogram']
+        bpm_axis = ac['bpm']
+
+        if tg.size == 0:
+            result = {
+                "bpm_curve": np.array([], dtype=float),
+                "strength_curve": np.array([], dtype=float)
+            }
+
+            self._cache_tempogram[key] = result
+            return result
+        
+        mask = (bpm_axis >= bpm_min) & (bpm_axis <= bpm_max) & np.isfinite(bpm_axis)
+        if not np.any(mask):
+            result = {
+                "bpm_curve": np.array([], dtype=float),
+                "strength_curve": np.array([], dtype=float)
+            }
+
+            self._cache_tempogram[key] = result
+            return result
+        
+        idxs = np.where(mask)[0]
+        local_slice = tg[mask, :]
+        best_rel = np.argmax(local_slice, axis=0)
+        best_idx = idxs[best_rel]
+        bpm_curve = bpm_axis[best_idx]
+        strength_curve = local_slice[best_rel, np.arange(local_slice.shape[1])]
+
+        result = {
+            "bpm_curve": bpm_curve.astype(float),
+            "strength_curve": strength_curve.astype(float),
+            "times": ac["times"]
+        }
+
+        self._cache_tempogram[key] = result
+        return result
+    
+    def _pulse_clarity(self, bpm_min=40.0, bpm_max=240.0, norm_sum=True):
+        key = f"pulse_clarity_{bpm_min}_{bpm_max}_{norm_sum}"
+        if key in self._cache_tempogram:
+            return self._cache_tempogram[key]
+        
+        ac = self._tempogram_autocorr(norm_sum=norm_sum)
+        tg = ac["tempogram"]
+        bpm_axis = ac["bpm"]
+
+        if tg.size == 0:
+            result = {
+                "clarity": 0.0,
+                "best_peak": 0.0,
+                "runner-up": 0.0
+            }
+
+            self._cache_tempogram[key] = result
+            return result
+        
+        mask = (bpm_axis >= bpm_min) & (bpm_axis <= bpm_max) & np.isfinite(bpm_axis)
+
+        if not np.any(mask):
+            result = {
+                "clarity": 0.0,
+                "best_peak": 0.0,
+                "runner-up": 0.0
+            }
+
+            self._cache_tempogram[key] = result
+            return result
+
+        vals = np.mean(tg[mask, :], axis=1)
+
+        if vals.size == 0:
+            clarity = 0.0
+            best = 0.0
+            second = 0.0
+        elif vals.size == 1:
+            vals_normalized = vals / (np.max(vals) + EPS)
+            best = float(vals_normalized[0])
+            second = 0.0
+            clarity = 1.0  # Or a specific logic for single-peak signals
+        else:
+            vals_normalized = vals / (np.max(vals) + EPS)
+            s = np.sort(vals_normalized)
+            best = float(s[-1])
+            second = float(s[-2])
+            clarity = (best - second) / (best + EPS)
+
+        result = {
+            "clarity": safe_clip01(clarity),
+            "best_peak": best,
+            "runner-up": second
+        }
+
+        self._cache_tempogram[key] = result
+        return result
+    
+    def _beat_periodicity_strength(self, bpm_min=40.0, bpm_max=240.0, norm_sum=True):
+        key = f"beat_periodicity_strength_{bpm_min}_{bpm_max}_{norm_sum}"
+        if key in self._cache_tempogram:
+            return self._cache_tempogram[key]
+        
+        g = self._global_bpm(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum)
+        strength = safe_clip01(g["strength"])
+
+        result = {
+            "strength": strength,
+            "bpm": g["bpm"],
+            "lag": g["lag"]
+        }
+
+        self._cache_tempogram[key] = result
+        return result
+    
+    def _tempo_stability_index(self, bpm_min=40.0, bpm_max=240.0, norm_sum=True):
+        key = f"tempo_stability_index_{bpm_min}_{bpm_max}_{norm_sum}"
+        if key in self._cache_tempogram:
+            return self._cache_tempogram[key]
+        
+        curve = self._local_bpm_curve(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum)["bpm_curve"]
+        if curve.size < 2:
+            result = {
+                "stability": 1.0,
+                "mean_bpm": 0.0,
+                "std_bpm": 0.0
+            }
+
+            self._cache_tempogram[key] = result
+            return result
+        
+        mean_bpm = float(np.mean(curve))
+        std_bpm = float(np.std(curve))
+        stability = 1.0 - (std_bpm/(mean_bpm + EPS))
+
+        result = {
+            "stability": safe_clip01(stability),
+            "mean_bpm": mean_bpm,
+            "std_bpm": std_bpm
+        }
+
+        self._cache_tempogram[key] = result
+        return result
+    
+    def _tempo_variation_curve(self, bpm_min=40.0, bpm_max=240.0, norm_sum=True):
+        key = f"tempo_variation_curve_{bpm_min}_{bpm_max}_{norm_sum}"
+        if key in self._cache_tempogram:
+            return self._cache_tempogram[key]
+        
+        g = self._global_bpm(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum)
+        l = self._local_bpm_curve(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum)
+
+        if l["bpm_curve"].size == 0:
+            result = {
+                "variation": np.array([], dtype=float),
+                "abs_variation": np.array([], dtype=float)
+            }
+
+            self._cache_tempogram[key] = result
+            return result
+        
+        variation = l["bpm_curve"] - g["bpm"]
+        result = {
+            "variation": variation.astype(float),
+            "abs_variation": np.abs(variation).astype(float),
+            "times": l["times"]
+        }
+
+        self._cache_tempogram[key] = result
+        return result
+    
+    def _beat_fluctuation_rate(self, bpm_min=40.0, bpm_max=240.0, norm_sum=True):
+        key = f"beat_fluctuation_rate_{bpm_min}_{bpm_max}_{norm_sum}"
+        if key in self._cache_tempogram:
+            return self._cache_tempogram[key]
+        
+        curve = self._local_bpm_curve(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum)["bpm_curve"]
+        if curve.size < 2:
+            self._cache_tempogram[key] = 0.0
+            return 0.0
+        
+        rate = float(np.mean(np.abs(np.diff(curve))))
+
+        self._cache_tempogram[key] = rate
+        return rate
+    
+    def _multi_periodic_structure(self, bpm_min=40.0, bpm_max=240.0, norm_sum=True):
+        key = f"multi_periodic_structure_{bpm_min}_{bpm_max}_{norm_sum}"
+        if key in self._cache_tempogram:
+            return self._cache_tempogram[key]
+        
+        ac = self._tempogram_autocorr(norm_sum=norm_sum)
+        tg = ac["tempogram"]
+        bpm_axis = ac["bpm"]
+
+        if tg.size == 0:
+            result = {
+                "score": 0.0,
+                "primary_bpm": 0.0,
+                "half_bpm": 0.0,
+                "double_bpm": 0.0
+            }
+
+            self._cache_tempogram[key] = result
+            return result
+        
+        global_ac = np.mean(tg, axis=1)
+        mask = (bpm_axis >= bpm_min) & (bpm_axis <= bpm_max) & np.isfinite(bpm_axis)
+        idxs = np.where(mask)[0]
+        if idxs.size == 0:
+            result = {
+                "score": 0.0,
+                "primary_bpm": 0.0,
+                "half_bpm": 0.0,
+                "double_bpm": 0.0
+            }
+
+            self._cache_tempogram[key] = result
+            return result
+        
+        best_idx = int(idxs[np.argmax(global_ac[mask])])
+        primary_bpm = float(bpm_axis[best_idx])
+        half_bpm = primary_bpm/2.0
+        double_bpm = primary_bpm*2.0
+
+        def nearest_val(target):
+            j = int(np.argmin(np.abs(bpm_axis - target)))
+            return float(global_ac[j]), float(bpm_axis[j])
+        
+        half_score, half_bpm_near = nearest_val(half_bpm)
+        double_score, double_bpm_near = nearest_val(double_bpm)
+        primary_score = float(global_ac[best_idx])
+
+        score = (half_score + double_score)/(primary_score + EPS)
+
+        result = {
+            "score": float(np.clip(score, 0.0, 2.0)),
+            "primary_bpm": primary_bpm,
+            "half_bpm": half_bpm_near,
+            "double_bpm": double_bpm_near,
+            "primary_score": primary_score,
+            "half_score": half_score,
+            "double_score": double_score 
+        }
+
+        self._cache_tempogram[key] = result
+        return result
+    
+    def _swing_ratio(self, bpm_min=40.0, bpm_max=240.0, norm_sum=True):
+        key = f"swing_ratio_{bpm_min}_{bpm_max}_{norm_sum}"
+        if key in self._cache_tempogram:
+            return self._cache_tempogram[key]
+        
+        ac = self._tempogram_autocorr(norm_sum=norm_sum)
+        tg = ac["tempogram"]
+        bpm_axis = ac["bpm"]
+
+        if tg.size == 0:
+            result = {
+                "ratio": 1.0,
+                "symmetry": 1.0
+            }
+
+            self._cache_tempogram[key] = result
+            return result
+        
+        global_ac = np.mean(tg, axis=1)
+        mask = (bpm_axis >= bpm_min) & (bpm_axis <= bpm_max) & np.isfinite(bpm_axis)
+        if not np.any(mask):
+            result = {
+                "ratio": 1.0,
+                "symmetry": 1.0
+            }
+
+            self._cache_tempogram[key] = result
+            return result
+        
+        idxs = np.where(mask)[0]
+        best_idx = int(idxs[np.argmax(global_ac[mask])])
+
+        half_idx = int(np.argmin(np.abs(bpm_axis - bpm_axis[best_idx]/2.0)))
+        double_idx = int(np.argmin(np.abs(bpm_axis - bpm_axis[best_idx]*2.0)))
+
+        half_score = float(global_ac[half_idx])
+        double_score = float(global_ac[double_idx])
+
+        ratio = (double_score + EPS)/(half_score + EPS)
+        symmetry = 1.0 - abs(np.log(ratio))/np.log(2.0)
+        symmetry = safe_clip01(symmetry)
+
+        result = {
+            "ratio": float(ratio),
+            "symmetry": symmetry,
+            "primary_bpm": float(bpm_axis[best_idx]),
+            "half_bpm": float(bpm_axis[half_idx]),
+            "double_bpm": float(bpm_axis[double_idx])
+        }
+
+        self._cache_tempogram[key] = result
+        return result 
+    
+    # Fourier Tempogram
+    # def _tempogram_fourier(self, win_length=None, center=None, window='hann'):
+    #     if win_length is None:
+    #         win_length = self.N
+    #     if center is None:
+    #         center = self.center
+
+    #     key = f"tempogram_fourier_win_{win_length}_center_{center}_window_{window}"
+    #     if key in self._cache_tempogram:
+    #         result = self._cache_tempogram[key]
+    #         return result
+        
+    #     # Get onset strength
+    #     onset_result = self._onset_strength()
+    #     onset_env = onset_result['onset_env']
+
+    #     onset_env = onset_env - np.mean(onset_env)
+
+    #     n_frames = len(onset_env)
+
+    #     # Create window function
+    #     if window == 'hann':
+    #         win_func = np.hanning(win_length)
+    #     elif window == 'hamming':
+    #         win_func = np.hamming(win_length)
+    #     elif window == 'blackman':
+    #         win_func = np.blackman(win_length)
+    #     else:
+    #         win_func = np.ones(win_length)
+
+    #     # Computer number of windows
+    #     if center:
+    #         n_windows = n_frames
+    #     else:
+    #         n_windows = n_frames - win_length + 1
+
+    #     if n_windows <= 0:
+    #         # Not enough frames
+    #         n_bins = win_length//2 + 1
+    #         tempogram = np.zeros((n_bins, 0), dtype=float)
+    #         bpm = np.zeros(n_bins, dtype=float)
+    #         times = np.array([], dtype=float)
+
+    #         result = {
+    #             'tempogram': tempogram,
+    #             'bpm': bpm,
+    #             'times': times
+    #         }
+
+    #         self._cache_tempogram[key] = result
+    #         return result
+        
+    #     # Initialize tempogram
+    #     n_bins = win_length//2 + 1 # Positive frequencies only
+    #     tempogram = np.zeros((n_bins, n_windows), dtype=float)
+
+    #     # Compute DFT for each window
+    #     for i in range(n_windows):
+    #         if center:
+    #             # Center window around frame i
+    #             start = max(0, i - win_length//2)
+    #             end = min(n_frames, i + win_length//2 + 1)
+
+    #             # Extract window
+    #             window_data = onset_env[start:end]
+
+    #             # Pad if necessary
+    #             if window_data.size < win_length:
+    #                 pad_left = (win_length - window_data.size)//2
+    #                 pad_right = win_length - window_data.size - pad_left
+    #                 window_data = np.pad(window_data, (pad_left, pad_right), mode='constant')
+    #         else:
+    #             # Sliding window
+    #             start = i
+    #             end = i + win_length
+    #             window_data = onset_env[start:end]
+
+    #         window_data = window_data - np.mean(window_data)
+
+    #         # Apply window function
+    #         windowed = window_data*win_func
+
+    #         # Compute FFT
+    #         fft = np.fft.rfft(windowed, n=win_length)
+
+    #         # Store magnitude
+    #         tempogram[:, i] = np.abs(fft)
+
+    #     # Compute BPM axis
+    #     # Frequency bins
+    #     freqs = np.fft.rfftfreq(win_length, d=1.0/self.frame_rate)
+
+    #     # Convert to BPM (beats per minute)
+    #     bpm = 60.0*freqs
+
+    #     # Compute window center times
+    #     if center:
+    #         window_times = onset_result["times"][:n_windows]
+    #     else:
+    #         window_centers = np.arange(n_windows) + win_length//2
+    #         window_times = librosa.frames_to_time(
+    #             window_centers,
+    #             sr=self.sr,
+    #             hop_length=self.H
+    #         )
+
+    #     result = {
+    #         'tempogram': tempogram,
+    #         'bpm': bpm,
+    #         'times': window_times
+    #     }
+
+    #     self._cache_tempogram[key] = result
+    #     return result
+
+    def _tempogram_fourier(self, win_length=None, center=None, window='hann', bpm_min=30.0, bpm_max=300.0):
+        if win_length is None:
+            win_length = self.N
+        if center is None:
+            center = self.center
+        
+        key= f"tempogram_fourier_win_{win_length}_center_{center}_window_{window}_{bpm_min}_{bpm_max}"
+        if key in self._cache_tempogram:
+            return self._cache_tempogram[key]
+        
+        onset = self._onset_strength()
+        onset_env = onset['onset_env']
+        times = onset['times']
+        n_frames = len(onset_env)
+
+        if window == "hann":
+            win_func = np.hanning(win_length)
+        elif window == "hamming":
+            win_func = np.hamming(win_length)
+        elif window == "blackman":
+            win_func = np.blackman(win_length)
+        else:
+            win_func = np.ones(win_length, dtype=float)
+
+        if center:
+            n_windows = n_frames
+        else:
+            n_windows = n_frames - win_length + 1
+
+        if n_windows <= 0:
+            n_bins = win_length//2 + 1
+            tempogram = np.zeros((n_bins, 0), dtype=float)
+            bpm = np.zeros(n_bins, dtype=float)
+            window_times = np.array([], dtype=float)
+
+            result = {
+                'tempogram': tempogram,
+                'bpm': bpm,
+                'times': window_times
+            }
+            self._cache_tempogram[key] = result
+            return result
+        
+        tempogram = np.zeros((win_length//2 + 1, n_windows), dtype=float)
+
+        for n in range(n_windows):
+            if center:
+                start = max(0, n - win_length//2)
+                end = min(n_frames, n + win_length//2 + 1)
+                x = onset_env[start:end]
+                if x.size < win_length:
+                    pad_left = (win_length - x.size)//2
+                    pad_right = win_length - x.size - pad_left
+                    x = np.pad(x, (pad_left, pad_right), mode='constant')
+            else:
+                x = onset_env[n:n + win_length]
+
+            if x.size < win_length:
+                continue
+
+            x = x - np.mean(x)
+            X = np.fft.rfft(x*win_func, n=win_length)
+            tempogram[:, n] = np.abs(X)
+            
+        freqs = np.fft.rfftfreq(win_length, d=1.0/self.frame_rate)
+        bpm = 60.0*freqs
+
+        if center:
+            window_times = times[:n_windows]
+        else:
+            window_centers = np.arange(n_windows) + win_length//2
+            window_times = librosa.frames_to_time(window_centers, sr=self.sr, hop_length=self.H)
+
+        result = {
+            'tempogram': tempogram,
+            'bpm': bpm,
+            'times': window_times
+        }
+
+        self._cache_tempogram[key] = result
+        return result
+    
+    def _tempo_spectrum(self, win_length=None, center=None, window="hann", average="mean"):
+        key = f"tempo_spectrum_{win_length}_{center}_{window}_{average}"
+        if key in self._cache_tempogram:
+            return self._cache_tempogram[key]
+        
+        ft = self._tempogram_fourier(win_length=win_length, center=center, window=window)
+        T = ft["tempogram"]
+        bpm = ft["bpm"]
+
+        if T.size == 0:
+            result = {
+                "spectrum": np.array([], dtype=float),
+                "bpm": bpm
+            }
+
+            self._cache_tempogram[key] = result
+            return result
+        
+        if average == "mean":
+            spectrum = np.mean(T, axis=1)
+        elif average == "median":
+            spectrum = np.median(T, axis=1)
+        else:
+            raise ValueError("average must be 'mean' or 'median'")
+        
+        result = {
+            "spectrum": spectrum.astype(float),
+            "bpm": bpm
+        }
+
+        self._cache_tempogram[key] = result
+        return result
+    
+    def _spectral_energy_at_tempo(self, tempo_bpm=None, win_length=None, center=None, window="hann"):
+        key = f"spectral_energy_at_tempo_{tempo_bpm}_{win_length}_{center}_{window}"
+        if key in self._cache_tempogram:
+            return self._cache_tempogram[key]
+        
+        spec = self._tempo_spectrum(win_length=win_length, center=center, window=window)
+        S = spec["spectrum"]
+        bpm = spec["bpm"]
+
+        if S.size == 0:
+            result = {
+                "energy": 0.0,
+                "bpm": bpm,
+                "spectrum": S
+            }
+
+            self._cache_tempogram[key] = result
+            return result
+
+        if tempo_bpm is None:
+            result = {
+                "energy": S,
+                "bpm": bpm,
+                "spectrum": S
+            }
+
+            self._cache_tempogram[key] = result
+            return result
+        
+        idx = int(np.argmin(np.abs(bpm - tempo_bpm)))
+        energy = float(S[idx])
+
+        result = {
+            "energy": energy,
+            "bpm": float(bpm[idx]),
+            "spectrum": S 
+        }
+
+        self._cache_tempogram[key] = result
+        return result
+    
+    def _dominant_tempo_energy(self, win_length=None, center=None, window="hann", top_k=5, bpm_min=40):
+        key = f"dominant_tempo_energy_{win_length}_{center}_{window}_{top_k}"
+        if key in self._cache_tempogram:
+            return self._cache_tempogram[key]
+        
+        spec = self._tempo_spectrum(win_length=win_length, center=center, window=window)
+        S = spec["spectrum"]
+        bpm = spec["bpm"]
+
+        if S.size == 0:
+            result = {
+                "bpm_peaks": np.array([], dtype=float),
+                "energies": np.array([], dtype=float),
+                "peak_ratios": np.array([], dtype=float)
+            }
+
+            self._cache_tempogram[key] = result
+            return result
+        
+        # Exclude DC and very low sub-harmonics
+        valid = np.where((bpm >= bpm_min))[0]
+        if valid.size == 0:
+            result = {
+                "bpm_peaks": np.array([], dtype=float),
+                "energies": np.array([], dtype=float),
+                "peak_ratios": np.array([], dtype=float)
+            }
+
+            self._cache_tempogram[key] = result
+            return result
+        
+        idx_sorted = valid[np.argsort(S[valid])[::-1]]
+        idx_top = idx_sorted[:top_k]
+
+        bpm_peaks = bpm[idx_top]
+        energies = S[idx_top]
+        peak_ratios = energies/(energies[0] + EPS)
+
+        result = {
+            "bpm_peaks": bpm_peaks.astype(float),
+            "energies": energies.astype(float),
+            "peak_ratios": peak_ratios.astype(float)
+        }
+
+        self._cache_tempogram[key] = result
+        return result
+    
+    def _tempo_spectral_centroid(self, win_length=None, center=None, window="hann", 
+                             bpm_min=30.0, bpm_max=300.0):
+        """
+        Tempo spectral centroid with BPM range filtering
+        """
+        key = f"tempo_spectral_centroid_{win_length}_{center}_{window}_{bpm_min}_{bpm_max}"
+        if key in self._cache_tempogram:
+            return self._cache_tempogram[key]
+        
+        spec = self._tempo_spectrum(win_length=win_length, center=center, window=window)
+        S = spec["spectrum"]
+        bpm = spec["bpm"]
+
+        if S.size == 0:
+            result = {
+                "centroid": 0.0,
+                "bpm": bpm 
+            }
+            self._cache_tempogram[key] = result
+            return result
+        
+        # Filter to plausible BPM range
+        valid_mask = (bpm >= bpm_min) & (bpm <= bpm_max)
+        S_filtered = S[valid_mask]
+        bpm_filtered = bpm[valid_mask]
+        
+        if S_filtered.size == 0 or np.sum(S_filtered) < EPS:
+            result = {
+                "centroid": 0.0,
+                "bpm": bpm 
+            }
+            self._cache_tempogram[key] = result
+            return result
+        
+        centroid = float(np.sum(bpm_filtered * S_filtered) / (np.sum(S_filtered) + EPS))
+        
+        result = {
+            "centroid": centroid,
+            "bpm": bpm 
+        }
+
+        self._cache_tempogram[key] = result
+        return result
+
+    def _tempo_bandwidth(self, win_length=None, center=None, window="hann",
+                        bpm_min=30.0, bpm_max=300.0):
+        """
+        Tempo spectral bandwidth with BPM range filtering
+        """
+        key = f"tempo_bandwidth_{win_length}_{center}_{window}_{bpm_min}_{bpm_max}"
+        if key in self._cache_tempogram:
+            return self._cache_tempogram[key]
+        
+        spec = self._tempo_spectrum(win_length=win_length, center=center, window=window)
+        S = spec["spectrum"]
+        bpm = spec["bpm"]
+
+        if S.size == 0:
+            result = {
+                "bandwidth": 0.0,
+                "centroid": 0.0,
+                "bpm": bpm 
+            }
+            self._cache_tempogram[key] = result
+            return result
+        
+        # Filter to plausible BPM range
+        valid_mask = (bpm >= bpm_min) & (bpm <= bpm_max)
+        S_filtered = S[valid_mask]
+        bpm_filtered = bpm[valid_mask]
+        
+        if S_filtered.size == 0 or np.sum(S_filtered) < EPS:
+            result = {
+                "bandwidth": 0.0,
+                "centroid": 0.0,
+                "bpm": bpm
+            }
+            self._cache_tempogram[key] = result
+            return result
+        
+        mu = np.sum(bpm_filtered * S_filtered) / (np.sum(S_filtered) + EPS)
+        bw = np.sqrt(np.sum((bpm_filtered - mu)**2 * S_filtered) / (np.sum(S_filtered) + EPS))
+
+        result = {
+            "bandwidth": float(bw),
+            "centroid": float(mu),
+            "bpm": bpm
+        }
+
+        self._cache_tempogram[key] = result
+        return result
+
+    def _tempo_skewness(self, win_length=None, center=None, window="hann",
+                    bpm_min=30.0, bpm_max=300.0):
+        """
+        Tempo spectral skewness with BPM range filtering
+        """
+        key = f"tempo_skewness_{win_length}_{center}_{window}_{bpm_min}_{bpm_max}"
+        if key in self._cache_tempogram:
+            return self._cache_tempogram[key]
+        
+        spec = self._tempo_spectrum(win_length=win_length, center=center, window=window)
+        S = spec["spectrum"]
+        bpm = spec["bpm"]
+
+        if S.size == 0:
+            result = {
+                "skewness": 0.0
+            }
+            self._cache_tempogram[key] = result
+            return result
+        
+        # Filter to plausible BPM range
+        valid_mask = (bpm >= bpm_min) & (bpm <= bpm_max)
+        S_filtered = S[valid_mask]
+        bpm_filtered = bpm[valid_mask]
+        
+        if S_filtered.size == 0 or np.sum(S_filtered) < EPS:
+            result = {
+                "skewness": 0.0,
+                "centroid": 0.0,
+                "bandwidth": 0.0,
+                "bpm": bpm
+            }
+            self._cache_tempogram[key] = result
+            return result
+        
+        mu = np.sum(bpm_filtered * S_filtered) / (np.sum(S_filtered) + EPS)
+        var = np.sum((bpm_filtered - mu)**2 * S_filtered) / (np.sum(S_filtered) + EPS)
+        sigma = np.sqrt(var)
+
+        if sigma < EPS:
+            skew = 0.0
+        else:
+            skew = np.sum((bpm_filtered - mu)**3 * S_filtered) / ((np.sum(S_filtered) + EPS) * (sigma**3 + EPS))
+
+        result = {
+            "skewness": float(skew),
+            "centroid": float(mu),
+            "bandwidth": float(sigma),
+            "bpm": bpm
+        }
+
+        self._cache_tempogram[key] = result
+        return result
+
+    def _tempo_kurtosis(self, win_length=None, center=None, window="hann", excess=True,
+                    bpm_min=30.0, bpm_max=300.0):
+        """
+        Tempo spectral kurtosis with BPM range filtering
+        """
+        key = f"tempo_kurtosis_{win_length}_{center}_{window}_{excess}_{bpm_min}_{bpm_max}"
+        if key in self._cache_tempogram:
+            return self._cache_tempogram[key]
+        
+        spec = self._tempo_spectrum(win_length=win_length, center=center, window=window)
+        S = spec["spectrum"]
+        bpm = spec["bpm"]
+
+        if S.size == 0:
+            result = {
+                "kurtosis": 0.0
+            }
+            self._cache_tempogram[key] = result
+            return result
+        
+        # Filter to plausible BPM range
+        valid_mask = (bpm >= bpm_min) & (bpm <= bpm_max)
+        S_filtered = S[valid_mask]
+        bpm_filtered = bpm[valid_mask]
+        
+        if S_filtered.size == 0 or np.sum(S_filtered) < EPS:
+            result = {
+                "kurtosis": 0.0,
+                "centroid": 0.0,
+                "bandwidth": 0.0,
+                "bpm": bpm
+            }
+            self._cache_tempogram[key] = result
+            return result
+        
+        mu = np.sum(bpm_filtered * S_filtered) / (np.sum(S_filtered) + EPS)
+        var = np.sum((bpm_filtered - mu)**2 * S_filtered) / (np.sum(S_filtered) + EPS)
+        sigma2 = var + EPS
+
+        kurt = np.sum((bpm_filtered - mu)**4 * S_filtered) / ((np.sum(S_filtered) + EPS) * (sigma2**2 + EPS))
+
+        if excess:
+            kurt -= 3.0
+
+        result = {
+            "kurtosis": float(kurt),
+            "centroid": float(mu),
+            "bandwidth": float(np.sqrt(var)),
+            "bpm": bpm
+        }
+
+        self._cache_tempogram[key] = result
+        return result
+    
+    # Beat Position
+    def _beat_time_from_frames(self, beat_frames):
+        beat_frames = np.asarray(beat_frames, dtype=int)
+        beat_times = librosa.frames_to_time(beat_frames, sr=self.sr, hop_length=self.H)
+
+        return beat_times
+    
+    def _beat_period_from_beats(self, beat_times):
+        beat_times = np.asarray(beat_times, dtype=float)
+        if beat_times.size < 2:
+            return 0.0
+        
+        periods = np.diff(beat_times)
+        median_period = float(np.median(periods))
+
+        return median_period
+    
+    def _beat_position(self, beat_times=None, beat_frames=None, mode="phase"):
+        """
+        Beat phase or position for each onset-envelope frame
+        mode:
+            - "phase": normalized phase in [0, 1) of the beat cycle
+            - "fractional": fractional position within the beat period (can be >1)
+            - "nearest": time to nearest beat (can be negative)
+        """
+        key = f"beat_position_{mode}"
+        if key in self._cache_tempogram:
+            return self._cache_tempogram[key]
+        
+        onset = self._onset_strength()
+        t = onset["times"]
+
+        if beat_times is None and beat_frames is None:
+            result = {
+                "beat_position": np.array([], dtype=float),
+                "beat_index": np.array([], dtype=int),
+                "beat_period": 0.0
+            }
+
+            self._cache_tempogram[key] = result
+            return result
+        
+        if beat_times is None:
+            beat_times = self._beat_time_from_frames(beat_frames)
+
+        beat_times = np.asarray(beat_times, dtype=float)
+        if beat_times.size < 2:
+            result = {
+                "beat_position": np.array([], dtype=float),
+                "beat_index": np.array([], dtype=int),
+                "beat_period": 0.0
+            }
+
+            self._cache_tempogram[key] = result
+            return result
+        
+        beat_period = self._beat_period_from_beats(beat_times)
+        idx = np.searchsorted(beat_times, t, side="right") - 1
+        idx = np.clip(idx, 0, beat_times.size - 2)
+
+        phase = (t - beat_times[idx])/(beat_times[idx + 1] - beat_times[idx] + EPS)
+        phase = np.mod(phase, 1.0)
+
+        if mode in ("phase", "fractional"):
+            pos = phase
+        elif mode == "nearest":
+            pos = phase
+            pos = np.where(pos > 0.5, pos - 1.0, pos)
+        else:
+            raise ValueError("mode must be 'phase', 'fractional', or 'nearest'")
+        
+        result = {
+            "beat_position": pos.astype(float),
+            "beat_index": idx.astype(int),
+            "beat_period": beat_period
+        }
+
+        self._cache_tempogram[key] = result
+        return result
+    
+    def _beat_alignment_histogram(self, beat_times=None, beat_frames=None, n_bins=16, normalize=True):
+        """
+        Histogram of event positions within the beat cycle, aligned to nearest beat
+        """
+        key = f"beat_alignment_histogram_{n_bins}_{normalize}"
+        if key in self._cache_tempogram:
+            return self._cache_tempogram[key]
+        
+        bp = self._beat_position(beat_times=beat_times, beat_frames=beat_frames, mode="phase")
+        phase = bp["beat_position"]
+
+        if phase.size == 0:
+            hist = np.zeros(n_bins, dtype=float)
+            result = {
+                "histogram": hist,
+                "bins": np.linspace(0, 1, n_bins + 1),
+                "peak_bin": -1
+            }
+
+            self._cache_tempogram[key] = result
+            return result
+        
+        hist, bins = np.histogram(phase, bins=n_bins, range=(0.0, 1.0))
+        hist = hist.astype(float)
+        if normalize:
+            hist = hist/(np.sum(hist) + EPS)
+
+        peak_bin = int(np.argmax(hist)) if hist.size > 0 else -1
+
+        result = {
+            "histogram": hist,
+            "bins": bins,
+            "peak_bin": peak_bin
+        }
+
+        self._cache_tempogram[key] = result
+        return result
+    
+    def _interbeat_interval_variance(self, beat_times=None, beat_frames=None, normalize=False):
+        """
+        Variance of inter-beat intervals, optionally normalized by mean interval
+        """
+        key = f"interbeat_interval_variance_{normalize}"
+        if key in self._cache_tempogram:
+            return self._cache_tempogram[key]
+        
+        if beat_times is None and beat_frames is None:
+            self._cache_tempogram[key] = 0.0
+            return 0.0
+        
+        if beat_times is None:
+            beat_times = self._beat_time_from_frames(beat_frames)
+
+        beat_times = np.asarray(beat_times, dtype=float)
+        if beat_times.size < 3:
+            self._cache_tempogram[key] = 0.0
+            return 0.0
+        
+        ibi = np.diff(beat_times)
+        var = float(np.var(ibi, ddof=1)) if ibi.size > 1 else 0.0
+
+        if normalize:
+            mean_ibi = float(np.mean(ibi))
+            var /= (mean_ibi**2 + EPS)
+
+        self._cache_tempogram[key] = var
+        return var
+    
+    def _beat_sync_offset(self, beat_times=None, beat_frames=None, event_times=None, event_frames=None, absolute=True):
+        """
+        Offset of events from nearest beat, averaged across all events. If absolute=True, returns mean absolute offset, otherwise returns mean signed offset (positive means event occurs after beat)
+        """
+        key = f"beat_sync_offset_{absolute}"
+        if key in self._cache_tempogram:
+            return self._cache_tempogram[key]
+        
+        if beat_times is None and beat_frames is None:
+            result = {
+                "offsets": np.array([], dtype=float),
+                "mean_offset": 0.0,
+                "mean_abs_offset": 0.0
+            }
+
+            self._cache_tempogram[key] = result
+            return result
+        
+        if beat_times is None:
+            beat_times = self._beat_time_from_frames(beat_frames)
+
+        if event_times is None:
+            onset = self._onset_strength()
+            event_times = onset["times"]
+        elif event_times is None and event_frames is not None:
+            event_times = librosa.frames_to_time(np.asarray(event_frames, dtype=int), sr=self.sr, hop_length=self.H)
+
+        beat_times = np.asarray(beat_times, dtype=float)
+        event_times = np.asarray(event_times, dtype=float)
+
+        if beat_times.size < 2 or event_times.size == 0:
+            result = {
+                "offsets": np.array([], dtype=float),
+                "mean_offset": 0.0,
+                "mean_abs_offset": 0.0
+            }
+
+            self._cache_tempogram[key] = result
+            return result
+        
+        idx = np.searchsorted(beat_times, event_times, side="right") - 1
+        idx = np.clip(idx, 0, beat_times.size - 2)
+
+        ibi = beat_times[idx + 1] - beat_times[idx]
+        offset = event_times - beat_times[idx]
+        offset_norm = offset/(ibi + EPS)
+
+        if absolute:
+            summary = float(np.mean(np.abs(offset)))
+            summary_norm = float(np.mean(np.abs(offset_norm)))
+        else:
+            summary = float(np.mean(offset))
+            summary_norm = float(np.mean(offset_norm))
+
+        result = {
+            "offsets": offset.astype(float),
+            "offsets_norm": offset_norm.astype(float),
+            "mean_offset": summary,
+            "mean_abs_offset": float(np.mean(np.abs(offset))),
+            "mean_offset_norm": summary_norm,
+            "mean_abs_offset_norm": float(np.mean(np.abs(offset_norm)))
+        }
+
+        self._cache_tempogram[key] = result
+        return result
+    
+class MFCCFeatures:
+    def __init__(self, sig, n_mfcc=13, n_mels=40, n_fft=None, hop_length=None, fmin=0.0, fmax=None, dct_type=2, norm="ortho", lifter=0, htk=False, center=True, pad_mode="constant", log_mels=False, power=2.0, dtype=np.float32, compute=True):
+        self.sig = sig
+        self.y = np.asarray(sig.y, dtype=float)
+        self.sr = sig.sr
+        self.N = int(n_fft if n_fft is not None else sig.N)
+        self.H = int(hop_length if hop_length is not None else sig.H)
+
+        self.n_mfcc = int(n_mfcc)
+        self.n_mels = int(n_mels)
+        self.fmin = float(fmin)
+        self.fmax = float(fmax) if fmax is not None else None
+        self.dct_type = dct_type
+        self.norm = norm
+        self.lifter = int(lifter)
+        self.htk = bool(htk)
+        self.center = bool(center)
+        self.pad_mode = pad_mode
+        self.log_mels = bool(log_mels)
+        self.power = float(power)
+        self.dtype = dtype
+
+        self._cache_mfcc = {}
+
+        self.S = None
+        self.S_db = None
+        self.mfcc = None
+        self.times = None
+
+        if compute:
+            self._compute_mfcc()
+
+    def _compute_mfcc(self):
+        key = f"mfcc_default"
+        if key in self._cache_mfcc:
+            return self._cache_mfcc[key]
+        
+        self.S = librosa.feature.melspectrogram(
+            y=self.y,
+            sr=self.sr,
+            n_fft=self.N,
+            hop_length=self.H,
+            win_length=self.N,
+            window="hann",
+            center=self.center,
+            pad_mode=self.pad_mode,
+            n_mels=self.n_mels,
+            power=self.power,
+            fmin=self.fmin,
+            fmax=self.fmax,
+            htk=self.htk,
+            dtype=self.dtype
+        )
+
+        if self.log_mels:
+            S_in = np.log(self.S + EPS)
+        else:
+            self.S_db = librosa.power_to_db(self.S, ref=np.max)
+            S_in = self.S_db
+
+        self.mfcc = librosa.feature.mfcc(
+            S=S_in,
+            sr=self.sr,
+            n_mfcc=self.n_mfcc,
+            dct_type=self.dct_type,
+            norm=self.norm,
+            lifter=self.lifter
+        )
+
+        self.times = librosa.frames_to_time(
+            np.arange(self.mfcc.shape[1]),
+            sr=self.sr,
+            hop_length=self.H
+        )
+
+        result = {
+            "S": self.S,
+            "S_db": self.S_db,
+            "mfcc": self.mfcc,
+            "times": self.times
+        }
+
+        self._cache_mfcc[key] = result
+        return result
+    
+    # Staticistics Features
+    def _mfcc_mean(self):
+        key = "mfcc_mean"
+        if key in self._cache_mfcc:
+            return self._cache_mfcc[key]
+        
+        M = self.mfcc
+        if M is None or M.size == 0:
+            result = np.array([], dtype=float)
+            self._cache_mfcc[key] = result
+            return result
+        
+        mean = np.mean(M, axis=1).astype(float)
+        self._cache_mfcc[key] = mean
+        return mean
+    
+    def _mfcc_variance(self, ddof=1):
+        key = f"mfcc_variance_ddof_{ddof}"
+        if key in self._cache_mfcc:
+            return self._cache_mfcc[key]
+        
+        M = self.mfcc
+        if M is None or M.size == 0:
+            result = np.array([], dtype=float)
+            self._cache_mfcc[key] = result
+            return result
+        
+        var = np.var(M, axis=1, ddof=ddof).astype(float)
+        self._cache_mfcc[key] = var
+        return var
+    
+    def _mfcc_skewness(self):
+        key = "mfcc_skewness"
+        if key in self._cache_mfcc:
+            return self._cache_mfcc[key]
+        
+        M = self.mfcc
+        if M is None or M.size == 0:
+            result = np.array([], dtype=float)
+            self._cache_mfcc[key] = result
+            return result
+        
+        mu = self._mfcc_mean()
+        # Reshape mean to (n_mfcc, 1) for broadcasting across time frames
+        mu = mu[:, np.newaxis]
+        x = M - mu
+        m2 = np.mean(x**2, axis=1)
+        m3 = np.mean(x**3, axis=1)
+        skew = m3/(m2**1.5 + EPS)
+
+        skew = skew.astype(float)
+        self._cache_mfcc[key] = skew
+        return skew
+
+    def _mfcc_kurtosis(self, excess=True):
+        key = f"mfcc_kurtosis_excess_{excess}"
+        if key in self._cache_mfcc:
+            return self._cache_mfcc[key]
+
+        M = self.mfcc
+        if M is None or M.size == 0:
+            result = np.array([], dtype=float)
+            self._cache_mfcc[key] = result
+            return result
+        
+        mu = self._mfcc_mean()
+        # Reshape mean to (n_mfcc, 1) for broadcasting across time frames
+        mu = mu[:, np.newaxis]
+        x = M - mu
+        m2 = np.mean(x**2, axis=1)
+        m4 = np.mean(x**4, axis=1)
+        kurt = m4/(m2**2 + EPS)
+
+        if excess:
+            kurt -= 3.0
+
+        kurt = kurt.astype(float)
+        self._cache_mfcc[key] = kurt
+        return kurt
+    
+    # Temporal Features
+    def _mfcc_delta(self, width=9, order=1, mode="interp"):
+        key = f"mfcc_delta_width_{width}_order_{order}_mode_{mode}"
+        if key in self._cache_mfcc:
+            return self._cache_mfcc[key]
+        
+        if self.mfcc is None or self.mfcc.size == 0:
+            result = np.array([[]], dtype=float)
+            self._cache_mfcc[key] = result
+            return result
+        
+        delta = librosa.feature.delta(
+            self.mfcc,
+            width=width,
+            order=order,
+            axis=1,
+            mode=mode
+        )
+
+        delta = delta.astype(float)
+        self._cache_mfcc[key] = delta
+        return delta
+    
+    def _mfcc_delta2(self, width=9, mode="interp"):
+        return self._mfcc_delta(width=width, order=2, mode=mode)
+    
+    def _mfcc_temporal_stability(self, ddof=0):
+        key = f"mfcc_temporal_stability_ddof_{ddof}"
+        if key in self._cache_mfcc:
+            return self._cache_mfcc[key]
+        
+        if self.mfcc is None or self.mfcc.size == 0:
+            result = np.array([], dtype=float)
+            self._cache_mfcc[key] = result
+            return result
+        
+        mu = self._mfcc_mean()
+        sigma = np.std(self.mfcc, axis=1, ddof=ddof)
+        cv = sigma/(np.abs(mu) + EPS)
+        stability = 1.0/(1.0 + cv)
+
+        stability = stability.astype(float)
+        self._cache_mfcc[key] = stability
+        return stability
+    
+    def _mfcc_autocorrelation(self, max_lag=None, normalize=True):
+        key = f"mfcc_autocorrelation_maxlag_{max_lag}_normalize_{normalize}"
+        if key in self._cache_mfcc:
+            return self._cache_mfcc[key]
+        
+        if self.mfcc is None or self.mfcc.size == 0:
+            result = {
+                "acf": np.array([[]], dtype=float),
+                "lags": np.array([], dtype=int)
+            }
+
+            self._cache_mfcc[key] = result
+            return result
+        
+        M, T = self.mfcc.shape
+        if max_lag is None:
+            max_lag = min(T - 1, int(self.frame_rate*4.0))
+        max_lag = int(max(1, min(max_lag, T - 1)))
+
+        acf = np.zeros((M, max_lag + 1), dtype=float)
+
+        for k in range(M):
+            x = self.mfcc[k] - np.mean(self.mfcc[k])
+            r = np.correlate(x, x, mode='full')
+            if normalize:
+                r /= (r[0] + EPS)
+
+            acf[k] = r
+
+        lags = np.arange(max_lag + 1, dtype=int)
+        result = {
+            "acf": acf,
+            "lags": lags
+        }
+        self._cache_mfcc[key] = result
+        return result
+
+    # Spectral Shape Proxies
+    def _mfcc_spectral_slope_proxy(self, coeff=0, aggregate="mean"):
+        key = f"mfcc_spectral_slope_proxy_coeff_{coeff}_aggregate_{aggregate}"
+        if key in self._cache_mfcc:
+            return self._cache_mfcc[key]
+
+        if self.mfcc is None or self.mfcc.size == 0:
+            result = 0.0
+            self._cache_mfcc[key] = result
+            return result
+
+        x = self.mfcc[coeff]
+        if aggregate == "mean":
+            proxy = float(np.mean(x))
+        elif aggregate == "median":
+            proxy = float(np.median(x))
+        elif aggregate == "rms":
+            proxy = float(np.sqrt(np.mean(x**2)))
+        else:
+            raise ValueError("Invalid aggregate method: must be 'mean', 'median', or 'rms'")
+        
+        self._cache_mfcc[key] = proxy
+        return proxy
+    
+    def _mfcc_brightness_proxy(self, coeff=0, invert=False, aggregate="mean"):
+        key = f"mfcc_brightness_proxy_coeff_{coeff}_invert_{invert}_aggregate_{aggregate}"
+        if key in self._cache_mfcc:
+            return self._cache_mfcc[key]
+        
+        vals = self._mfcc_spectral_slope_proxy(coeff=coeff, aggregate=aggregate)
+        brightness = -vals if invert else vals
+
+        self._cache_mfcc[key] = float(brightness)
+        return float(brightness)
+    
+    def _mfcc_sharpness_proxy(self, coeff=0, aggregate="mean", absolute=True):
+        key = f"mfcc_sharpness_proxy_coeff_{coeff}_aggregate_{aggregate}_absolute_{absolute}"
+        if key in self._cache_mfcc:
+            return self._cache_mfcc[key]
+        
+        if self.mfcc is None or self.mfcc.size == 0:
+            result = 0.0
+            self._cache_mfcc[key] = result
+            return result
+        
+        x = self.mfcc[coeff]
+        if aggregate == "mean":
+            val = float(np.mean(x))
+        elif aggregate == "median":
+            val = float(np.median(x))
+        elif aggregate == "rms":
+            val = float(np.sqrt(np.mean(x**2)))
+        else:
+            raise ValueError("Invalid aggregate method: must be 'mean', 'median', or 'rms'")
+        
+        if absolute:
+            val = np.abs(val)
+
+        self._cache_mfcc[key] = float(val)
+        return float(val)
+    
+    def _mfcc_high_order_energy(self, start_coeff=6, normalize=False, order='l2'):
+        key = f"mfcc_high_order_energy_start_{start_coeff}_normalize_{normalize}_order_{order}"
+        if key in self._cache_mfcc:
+            return self._cache_mfcc[key]
+        
+        if self.mfcc is None or self.mfcc.size == 0:
+            result = 0.0
+            self._cache_mfcc[key] = result
+            return result
+
+        X = self.mfcc[start_coeff:, :]
+        if X.size == 0:
+            result = 0.0
+            self._cache_mfcc[key] = result
+            return result
+        
+        if order == 'l2':
+            energy = float(np.sum(X**2))
+        elif order == 'l1':
+            energy = float(np.sum(np.abs(X)))
+        elif order == 'rms':
+            energy = float(np.sqrt(np.mean(X**2)))
+        else:
+            raise ValueError("Invalid order: must be 'l2', 'l1', or 'rms'")
+        
+        if normalize:
+            denom = float(np.sum(self.mfcc**2) + EPS) if order == 'l2' else float(np.sum(np.abs(self.mfcc)) + EPS)
+            energy /= denom
+
+        self._cache_mfcc[key] = energy
+        return energy
+    
+    def _mfcc_noise_inharmonicity_proxy(self, coeff=0, normalize=True):
+        key = f"mfcc_noise_inharmonicity_proxy_coeff_{coeff}_normalize_{normalize}"
+        if key in self._cache_mfcc:
+            return self._cache_mfcc[key]
+        
+        result = self._mfcc_high_order_energy(start_coeff=coeff, normalize=normalize, order='l2')
+
+        self._cache_mfcc[key] = result
+        return result
+
+    # Envelope Features
+    def _mfcc_attack_smoothness(self, attack_frames=None, normalize=True):
+        key = f"mfcc_attack_smoothness_normalize_{attack_frames}_{normalize}"
+        if key in self._cache_mfcc:
+            return self._cache_mfcc[key]
+        
+        if self.mfcc is None or self.mfcc.size == 0:
+            result = 0.0
+            self._cache_mfcc[key] = result
+            return result
+        
+        X = self.mfcc
+        T = X.shape[1]
+
+        if attack_frames is None:
+            attack_frames = max(2, min(T//5, 10))
+        attack_frames = int(max(2, min(attack_frames, T)))
+
+        segment = X[:, :attack_frames]
+        diff = np.diff(segment, axis=1)
+        step_energy = np.linalg.norm(diffs, axis=0)
+
+        if step_energy.size == 0:
+            result = 1.0
+            self._cache_mfcc[key] = result
+            return result
+        
+        if normalize:
+            denom = np.max(np.linalg.norm(segment, axis=0)) + EPS
+            smoothness = 1.0 - (np.mean(step_energy)/denom)
+        else:
+            smoothness = 1.0/(1.0 + np.mean(step_energy))
+
+        smoothness = float(safe_clip01(smoothness))
+        self._cache_mfcc[key] = smoothness
+        return smoothness
+    
+    def _mfcc_sustain_stability(self, attack_frames=None, sustain_frames=None, ddof=0, normalize=True):
+        key = f"mfcc_sustain_stability_attack_{attack_frames}_sustain_{sustain_frames}_ddof_{ddof}_normalize_{normalize}"
+        if key in self._cache_mfcc:
+            return self._cache_mfcc[key]
+        
+        if self.mfcc is None or self.mfcc.size == 0:
+            result = 0.0
+            self._cache_mfcc[key] = result
+            return result
+        
+        X = self.mfcc
+        T = X.shape[1]
+
+        if attack_frames is None:
+            attack_frames = max(2, min(T//5, 10))
+        attack_frames = int(max(0, min(attack_frames, T)))
+
+        if sustain_frames is None:
+            sustain_frames = T - attack_frames
+        sustain_frames = int(max(0, min(sustain_frames, T - attack_frames)))
+
+        start = attack_frames
+        end = min(T, attack_frames + sustain_frames)
+
+        if end <= start:
+            result = 1.0
+            self._cache_mfcc[key] = result
+            return result
+        
+        sustain = X[:, start:end]
+        mu = np.mean(sustain, axis=1)
+        sigma = np.std(sustain, axis=1, ddof=ddof)
+
+        if normalize:
+            stability = 1.0 - np.mean(sigma/(np.abs(mu) + EPS))
+        else:
+            stability = 1.0/(1.0 + np.mean(sigma))
+
+        result = float(safe_clip01(stability))
+        self._cache_mfcc[key] = result
+        return result
+    
+    def _mfcc_smoothness_index(self, weight_delta=1.0, weight_ddelta=0.5, normalize=True):
+        key = f"mfcc_smoothness_index_weight_delta_{weight_delta}_weight_ddelta_{weight_ddelta}_normalize_{normalize}"
+        if key in self._cache_mfcc:
+            return self._cache_mfcc[key]
+        
+        if self.mfcc is None or self.mfcc.size == 0:
+            result = 0.0
+            self._cache_mfcc[key] = result
+            return result
+        
+        X = self.mfcc
+        diffs1 = np.diff(X, axis=1)
+        diffs2 = np.diff(X, n=2, axis=1)
+
+        e1 = np.mean(np.linalg.norm(diffs1, axis=0)) if diffs1.size > 0 else 0.0
+        e2 = np.mean(np.linalg.norm(diffs2, axis=0)) if diffs2.size > 0 else 0.0
+
+        roughness = weight_delta*e1 + weight_ddelta*e2
+
+        if normalize:
+            scale = np.mean(np.linalg.norm(X, axis=0)) + EPS
+            smoothness = 1.0/(1.0 + roughness/scale)
+        else:
+            smoothness = 1.0/(1.0 + roughness)
+
+        smoothness = float(safe_clip01(smoothness))
+        self._cache_mfcc[key] = smoothness
+        return smoothness
+
+    # Noise/Speech Proxies
+    def _mfcc_high_order_magnitude(self, start_coeff=6, mode='l2', normalize=True):
+        key = f"mfcc_high_order_magnitude_start_{start_coeff}_mode_{mode}_normalize_{normalize}"
+        if key in self._cache_mfcc:
+            return self._cache_mfcc[key]
+        
+        if self.mfcc is None or self.mfcc.size == 0:
+            result = 0.0
+            self._cache_mfcc[key] = result
+            return result
+        
+        X = self.mfcc[start_coeff:, :]
+        if X.size == 0:
+            result = 0.0
+            self._cache_mfcc[key] = result
+            return result
+        
+        if mode == 'l2':
+            val = np.sqrt(np.mean(X**2))
+        elif mode == 'l1':
+            val = np.mean(np.abs(X))
+        elif mode == 'energy':
+            val = np.mean(X**2)
+        else:
+            raise ValueError("Invalid mode: must be 'l2', 'l1', or 'energy'")
+        
+        if normalize:
+            denom = np.sqrt(np.mean(self.mfcc**2)) + EPS if mode == 'l2' else np.mean(np.abs(self.mfcc)) + EPS
+            val /= denom
+        
+        self._cache_mfcc[key] = float(val)
+        return float(val)
+    
+    def _mfcc_formant_shape_detection(self, reference=None, normalize=True, coeffs=(0, 1, 2, 3)):
+        key = f"mfcc_formant_shape_detection_{reference is not None}_normalize_{normalize}_coeffs_{coeffs}"
+        if key in self._cache_mfcc:
+            return self._cache_mfcc[key]
+        
+        if self.mfcc is None or self.mfcc.size == 0:
+            result = 0.0
+            self._cache_mfcc[key] = result
+            return result
+        
+        idx = np.array(coeffs, dtype=int)
+        idx = idx[idx < self.mfcc.shape[0]]
+        if idx.size == 0:
+            result = {
+                "score": 0.0,
+                "pattern": np.array([], dtype=float)
+            }
+            self._cache_mfcc[key] = result
+            return result
+        
+        pattern = np.mean(self.mfcc[idx, :], axis=1).astype(float)
+
+        if normalize:
+            pattern = (pattern - np.mean(pattern))/(np.std(pattern) + EPS)
+
+        if reference is None:
+            score = float(np.linalg.norm(pattern))
+        else:
+            reference = np.asrray(reference, dtype=float).reshape(-1)
+            m = min(reference.size, pattern.size)
+            if m == 0:
+                score = 0.0
+            else:
+                score = float(np.linalg.norm(pattern[:m] - reference[:m]))
+
+        result = {
+            "score": score,
+            "pattern": pattern
+        }
+        self._cache_mfcc[key] = result
+        return result
+    
+    def _mfcc_transient_roughness(self, width=9, normalize=True, mode="interp"):
+        key = f"mfcc_transient_roughness_{width}_{normalize}_{mode}"
+        if key in self._cache_mfcc:
+            return self._cache_mfcc[key]
+        
+        if self.mfcc is None or self.mfcc.size == 0:
+            result = 0.0
+            self._cache_mfcc[key] = 0.0
+            return result
+        
+        d1 = librosa.feature.delta(X, width=width, order=1, axis=1, mode=mode)
+        d2 = librosa.feature.delta(X, width=width, order=2, axis=1, mode=mode)
+
+        rough1 = np.mean(np.linalg.norm(d1, axis=0))
+        rough2 = np.mean(np.linalg.norm(d2, axis=0))
+
+        if normalize:
+            scale = np.mean(np.linalg.norm(X, axis=0)) + EPS
+            roughness = (rough1 + 0.5*rough2)/scale
+        else:
+            roughness = rough1 + 0.5*rough2
+
+        self._cache_mfcc[key] = float(roughness)
+        return roughness
