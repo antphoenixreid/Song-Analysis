@@ -150,7 +150,6 @@ class AudioSignal:
         # compute once lazily — requires cache initialized
         self._cache: Dict[str, object] = {}
 
-# ---------- Base Time Features ----------
 class TimeFeatures():
     def __init__(self, sig: AudioSignal):
         # super().__init__(audio_path, N, H)
@@ -178,23 +177,26 @@ class TimeFeatures():
     def _global_loudness_dB(self) -> float:
         if getattr(self, "invalid", False):
             return -80.0
-        if "global_loudness_dB" in self._cache_time:
-            return self._cache_time["global_loudness_dB"]
+
+        key = "global_loudness_dB"
+        if key in self._cache_time:
+            return self._cache_time[key]
         
         rms = np.sqrt(np.mean(self.y**2)) + EPS
         if rms < 1e-10:
-            self._cache_time["global_loudness_dB"] = -80.0
+            self._cache_time[key] = -80.0
             return -80.0
         
         loud_db = 20.0*np.log10(rms)
 
-        self._cache_time["global_loudness_dB"] = loud_db
+        self._cache_time[key] = loud_db
         return loud_db
 
     # Amplitude/Loudness Features
     def _rms_envelope(self) -> np.ndarray:
-        if "rms_env" in self._cache_time:
-            return self._cache_time["rms_env"]
+        key = "rms_env"
+        if key in self._cache_time:
+            return self._cache_time[key]
         
         num_frames = 1 + int((len(self.y) - self.N) // self.H)
         rms_env = np.zeros(num_frames, dtype=float)
@@ -206,22 +208,24 @@ class TimeFeatures():
 
             rms_env[i] = float(np.sqrt(np.mean(frame**2)))
 
-        self._cache_time["rms_env"] = rms_env
+        self._cache_time[key] = rms_env
         return rms_env
 
     def _short_time_energy(self) -> np.ndarray:
-        if "ste" in self._cache_time:
-            return self._cache_time["ste"]
+        key = "ste"
+        if key in self._cache_time:
+            return self._cache_time[key]
 
         rms_env = self._rms_envelope()
         ste = self.N*(rms_env**2)
 
-        self._cache_time["ste"] = ste
+        self._cache_time[key] = ste
         return ste
     
     def _peak_amplitude(self) -> np.ndarray:
-        if "peak_amp" in self._cache_time:
-            return self._cache_time["peak_amp"]
+        key = "peak_amp"
+        if key in self._cache_time:
+            return self._cache_time[key]
         
         num_frames = 1 + int((len(self.y) - self.N) // self.H)
         peak_amp = np.zeros(num_frames, dtype=float)
@@ -233,12 +237,13 @@ class TimeFeatures():
 
             peak_amp[i] = float(np.max(np.abs(frame)))
 
-        self._cache_time["peak_amp"] = peak_amp
+        self._cache_time[key] = peak_amp
         return peak_amp
     
     def _active_rms_mask(self, db_threshold: float = -60.0) -> np.ndarray:
-        if "active_mask" in self._cache_time:
-            return self._cache_time["active_mask"]
+        key = f"active_mask_{db_threshold}"
+        if key in self._cache_time:
+            return self._cache_time[key]
         
         rms_env = self._rms_envelope()
         peak_amp = self._peak_amplitude()
@@ -248,26 +253,28 @@ class TimeFeatures():
 
         mask = (rms_db > db_threshold) | (peak_db > db_threshold)
 
-        self._cache_time["active_mask"] = mask
+        self._cache_time[key] = mask
         return mask
     
-    def _crest_factor(self) -> np.ndarray:
-        if "crest_factor" in self._cache_time:
-            return self._cache_time["crest_factor"]
+    def _crest_factor(self, db_threshold: float = -60.0) -> np.ndarray:
+        key = f"crest_factor_{db_threshold}"
+        if key in self._cache_time:
+            return self._cache_time[key]
         
         rms_env = self._rms_envelope()
         peak_amp = self._peak_amplitude()
-        mask = self._active_rms_mask(db_threshold=-60.0)
+        mask = self._active_rms_mask(db_threshold=db_threshold)
 
         crest = np.zeros_like(rms_env)
         crest[mask] = peak_amp[mask]/(rms_env[mask] + EPS)
 
-        self._cache_time["crest_factor"] = crest
+        self._cache_time[key] = crest
         return crest
     
     def _dynamic_range(self) -> float:
-        if "dynamic_range" in self._cache_time:
-            return self._cache_time["dynamic_range"]
+        key = "dynamic_range"
+        if key in self._cache_time:
+            return self._cache_time[key]
         
         rms_env = self._rms_envelope()
 
@@ -275,41 +282,73 @@ class TimeFeatures():
         rms_db = np.clip(rms_db, -80.0, 0.0)
         dr = np.percentile(rms_db, 90) - np.percentile(rms_db, 10)
 
-        self._cache_time["dynamic_range"] = dr
+        self._cache_time[key] = dr
         return dr
     
-    def _onset_envelope(self) -> np.ndarray:
+    def _onset_envelope(self, 
+                    aggregate=np.median,
+                    n_mels=128,
+                    lag=1,
+                    max_size=1,
+                    detrend=False,
+                    center=True):
         """Cached onset strength envelope"""
-        if "onset_env_strength" in self._cache_time:
-            return self._cache_time["onset_env_strength"]
+        key = f"onset_env_strength_{aggregate}_{n_mels}_{lag}_{max_size}_{detrend}_{center}"
+        if key in self._cache_time:
+            return self._cache_time[key]
         
-        env = librosa.onset.onset_strength(y=self.y, sr=self.sr, hop_length=self.H)
-        self._cache_time["onset_env_strength"] = env
-        return env
+        onset_env = librosa.onset.onset_strength(
+            y=self.y,
+            sr=self.sr,
+            hop_length=self.H,
+            n_fft=self.N,
+            aggregate=aggregate,
+            n_mels=n_mels,
+            lag=lag,
+            max_size=max_size,
+            detrend=detrend,
+            center=center
+        )
+
+        onset_env = np.asarray(onset_env, dtype=float).ravel()
+
+        frame_rate = self.sr/float(self.H)
+        times = np.arange(len(onset_env))/frame_rate
+
+        result = {
+            'onset_env': onset_env,
+            'times': times,
+            'frame_rate': frame_rate
+        }
+
+        self._cache_time[key] = result
+        return result
 
     def _onset_frames(self) -> np.ndarray:
         """Cached onset detection frames"""
-        if "onset_frames" in self._cache_time:
-            return self._cache_time["onset_frames"]
+        key = "onset_frames"
+        if key in self._cache_time:
+            return self._cache_time[key]
         
-        env = self._onset_envelope()
+        env = self._onset_envelope()['onset_env']
         frames = librosa.onset.onset_detect(
             onset_envelope=env,
             sr=self.sr, hop_length=self.H,
             backtrack=False, units='frames'
         )
-        self._cache_time["onset_frames"] = frames
+        self._cache_time[key] = frames
         return frames
     
     def _attack_time(self) -> float:
-        if "attack_time" in self._cache_time:
-            return self._cache_time["attack_time"]
+        key = "attack_time"
+        if key in self._cache_time:
+            return self._cache_time[key]
 
         rms_env = self._rms_envelope()
         onsets = self._onset_frames()
         
         if len(onsets) == 0:
-            self._cache_time["attack_time"] = 0.0
+            self._cache_time[key] = 0.0
             return 0.0
         
         attack_times = []
@@ -336,18 +375,19 @@ class TimeFeatures():
                 attack_times.append(attack_frames*self.H/float(self.sr))
 
         if len(attack_times) == 0:
-            self._cache_time["attack_time"] = 0.0
+            self._cache_time[key] = 0.0
             return 0.0
         
         avg_attack_time = float(np.median(attack_times))
 
-        self._cache_time["attack_time"] = avg_attack_time
+        self._cache_time[key] = avg_attack_time
         return avg_attack_time
     
     def _attack_slope(self) -> float:
         """Average attack slope across all onsets (dB/second)"""
-        if "attack_slope" in self._cache_time:
-            return self._cache_time["attack_slope"]
+        key = "attack_slope"
+        if key in self._cache_time:
+            return self._cache_time[key]
         
         rms_env = self._rms_envelope()
         rms_dB = 20.0 * np.log10(rms_env + EPS)
@@ -355,7 +395,7 @@ class TimeFeatures():
         onsets = self._onset_frames()
         
         if len(onsets) == 0:
-            self._cache_time["attack_slope"] = 0.0
+            self._cache_time[key] = 0.0
             return 0.0
         
         attack_slopes = []
@@ -386,17 +426,18 @@ class TimeFeatures():
                     attack_slopes.append(slope)
         
         if len(attack_slopes) == 0:
-            self._cache_time["attack_slope"] = 0.0
+            self._cache_time[key] = 0.0
             return 0.0
         
         avg_slope = float(np.median(attack_slopes))
-        self._cache_time["attack_slope"] = avg_slope
+        self._cache_time[key] = avg_slope
         return avg_slope
     
     def _decay_slope(self) -> float:
         """Average decay slope across all onsets (dB/second)"""
-        if "decay_slope" in self._cache_time:
-            return self._cache_time["decay_slope"]
+        key = "decay_slope"
+        if key in self._cache_time:
+            return self._cache_time[key]
         
         rms_env = self._rms_envelope()
         rms_dB = 20.0 * np.log10(rms_env + EPS)
@@ -404,7 +445,7 @@ class TimeFeatures():
         onsets = self._onset_frames()
         
         if len(onsets) == 0:
-            self._cache_time["decay_slope"] = 0.0
+            self._cache_time[key] = 0.0
             return 0.0
         
         decay_slopes = []
@@ -438,23 +479,24 @@ class TimeFeatures():
                     decay_slopes.append(slope)
         
         if len(decay_slopes) == 0:
-            self._cache_time["decay_slope"] = 0.0
+            self._cache_time[key] = 0.0
             return 0.0
         
         avg_slope = float(np.median(decay_slopes))
-        self._cache_time["decay_slope"] = avg_slope
+        self._cache_time[key] = avg_slope
         return avg_slope
     
     def _energy_variance(self) -> float:
-        if "energy_variance" in self._cache_time:
-            return self._cache_time["energy_variance"]
+        key = "energy_variance"
+        if key in self._cache_time:
+            return self._cache_time[key]
         
         rms_env = self._rms_envelope()
         mask = self._active_rms_mask(db_threshold=-60.0)
         active = rms_env[mask]
 
         if active.size < 2:
-            self._cache_time["energy_variance"] = 0.0
+            self._cache_time[key] = 0.0
             return 0.0
         
         q75, q25 = np.percentile(active, [75 ,25])
@@ -462,25 +504,26 @@ class TimeFeatures():
 
         var = float(iqr/(np.median(active) + EPS))
 
-        self._cache_time["energy_variance"] = var
+        self._cache_time[key] = var
         return var
     
-    def _energy_modulation_rate(self) -> float:
-        if "energy_mod_rate" in self._cache_time:
-            return self._cache_time["energy_mod_rate"]
+    def _energy_modulation_rate(self, db_threshold: float = -60.0) -> float:
+        key = f"energy_mod_rate_{db_threshold}"
+        if key in self._cache_time:
+            return self._cache_time[key]
         
         rms_env = self._rms_envelope()
 
         if rms_env.size < 2:
-            self._cache_time["energy_mod_rate"] = 0.0
+            self._cache_time[key] = 0.0
             return 0.0
         
-        mask = self._active_rms_mask(db_threshold=-60.0)
+        mask = self._active_rms_mask(db_threshold=db_threshold)
         active = rms_env[mask]
         silence_ratio = 1.0 - (mask.sum()/len(mask))
 
         if active.size < 2:
-            self._cache_time["energy_mod_rate"] = 0.0
+            self._cache_time[key] = 0.0
             return 0.0
         
         med = np.median(active)
@@ -493,20 +536,21 @@ class TimeFeatures():
         iqr = q75 - q25
 
         if iqr < max(1e-4, 0.01*med):
-            self._cache_time["energy_mod_rate"] = 0.0
+            self._cache_time[key] = 0.0
             return 0.0
         
         rms_n = np.clip((rms_env - q25) / iqr, -1.0, 3.0)
         mod_sig = np.abs(np.diff(rms_n))
         mod_rate = float(np.var(mod_sig))
 
-        self._cache_time["energy_mod_rate"] = mod_rate
+        self._cache_time[key] = mod_rate
         return mod_rate
     
     # Noise/Speechiness Features
     def _zero_crossing_rate(self) -> np.ndarray:
-        if "zcr" in self._cache_time:
-            return self._cache_time["zcr"]
+        key = "zcr"
+        if key in self._cache_time:
+            return self._cache_time[key]
         
         num_frames = 1 + int((len(self.y) - self.N) // self.H)
         zcr = np.zeros(num_frames, dtype=float)
@@ -522,19 +566,20 @@ class TimeFeatures():
             crossings = np.sum(np.abs(np.diff(signs)))/2.0
             zcr[i] = float(crossings/len(frame))
 
-        self._cache_time["zcr"] = zcr
+        self._cache_time[key] = zcr
         return zcr
     
     def _zcr_variance(self) -> float:
-        if "zcr_variance" in self._cache_time:
-            return self._cache_time["zcr_variance"]
+        key = "zcr_variance"
+        if key in self._cache_time:
+            return self._cache_time[key]
         
         zcr = self._zero_crossing_rate()
         mask = self._active_rms_mask(db_threshold=-60.0)
         active_zcr = zcr[mask]
 
         if active_zcr.size < 2:
-            self._cache_time["zcr_variance"] = 0.0
+            self._cache_time[key] = 0.0
             return 0.0
         
         q75, q25 = np.percentile(active_zcr, [75 ,25])
@@ -542,18 +587,19 @@ class TimeFeatures():
 
         var = float(iqr/(np.median(active_zcr) + EPS))
 
-        self._cache_time["zcr_variance"] = var
+        self._cache_time[key] = var
         return var
     
-    def _voiced_ratio(self) -> float:
-        if "voiced_ratio" in self._cache_time:
-            return self._cache_time["voiced_ratio"]
+    def _voiced_ratio(self, db_threshold: float = -60.0) -> float:
+        key = f"voiced_ratio_{db_threshold}"
+        if key in self._cache_time:
+            return self._cache_time[key]
         
         zcr = self._zero_crossing_rate()
-        mask = self._active_rms_mask(db_threshold=-60.0)
+        mask = self._active_rms_mask(db_threshold=db_threshold)
 
         if mask.sum() < 2:
-            self._cache_time["voiced_ratio"] = 0.0
+            self._cache_time[key] = 0.0
             return 0.0
         
         num_frames = len(zcr)
@@ -608,15 +654,16 @@ class TimeFeatures():
 
         ratio = float(voiced_frames)/float(active_frames + EPS)
 
-        self._cache_time["voiced_ratio"] = ratio
+        self._cache_time[key] = ratio
         return ratio
     
     def _unvoiced_ratio(self) -> float:
         return 1.0 - self._voiced_ratio()
     
     def _transient_rate(self) -> float:
-        if "transient_rate" in self._cache_time:
-            return self._cache_time["transient_rate"]
+        key = "transient_rate"
+        if key in self._cache_time:
+            return self._cache_time[key]
         
         ste = self._short_time_energy()
 
@@ -630,7 +677,7 @@ class TimeFeatures():
         duration = len(self.y)/float(self.sr)
         rate = float(len(peaks))/duration
 
-        self._cache_time["transient_rate"] = rate
+        self._cache_time[key] = rate
         return rate
 
     def _transient_counts(self) -> int:
@@ -644,14 +691,15 @@ class TimeFeatures():
         """
         Return onset times (seconds) from peaks in onset envelope
         """
-        if "onset_times" in self._cache_time:
-            return self._cache_time["onset_times"]
+        key = "onset_times"
+        if key in self._cache_time:
+            return self._cache_time[key]
         
-        onset_env = self._onset_envelope()
+        onset_env = self._onset_envelope()['onset_env']
 
         if onset_env.size == 0:
-            self._cache_time["onset_times"] = np.array([], dtype=float)
-            return self._cache_time["onset_times"]
+            self._cache_time[key] = np.array([], dtype=float)
+            return self._cache_time[key]
         
         # Adaptive threshold: median + k*MAD
         med = np.median(onset_env)
@@ -664,28 +712,29 @@ class TimeFeatures():
         # Convert frame indices to time (seconds)
         times = (peaks*self.H)/float(self.sr)
 
-        self._cache_time["onset_times"] = times.astype(float)
+        self._cache_time[key] = times.astype(float)
         return times.astype(float)
     
     def _onset_rate(self) -> float:
         """
         Average number of onsets per second
         """
-        if "onset_rate" in self._cache_time:
+        key = "onset_rate"
+        if key in self._cache_time:
             return self._cache_time["onset_rate"]
         
         onset_times = self._onset_times()
         if onset_times.size == 0:
-            self._cache_time["onset_rate"] = 0.0
+            self._cache_time[key] = 0.0
             return 0.0
 
         duration = len(self.y)/float(self.sr)
         if duration <= 0:
-            self._cache_time["onset_rate"] = 0.0
+            self._cache_time[key] = 0.0
             return 0.0
         
         rate = float(onset_times.size)/duration
-        self._cache_time["onset_rate"] = rate
+        self._cache_time[key] = rate
         return rate 
     
     def _ioi_values(self) -> np.ndarray:
@@ -724,128 +773,235 @@ class TimeFeatures():
 
         return (mean_ioi, std_ioi, cv_ioi)
 
-    def _onset_autocorrelation(self) -> np.ndarray:
+    def _onset_autocorrelation(self, max_lag=None, normalize=True) -> np.ndarray:
         """
         Normalized autocorrelation of onset envelope
         """
-        if "ac_onset" in self._cache_time:
-            return self._cache_time["ac_onset"]
+        key = f"ac_onset_{max_lag}_{normalize}"
+        if key in self._cache_time:
+            return self._cache_time[key]
 
-        onset_env = self._onset_envelope()
-        if onset_env.size == 0:
-            self._cache_time["ac_onset"] = np.array([], dtype=float)
-            return self._cache_time["ac_onset"]
-        
-        x = onset_env - np.mean(onset_env)
-        ac_full = np.correlate(x, x, mode="full")
-        ac = ac_full[len(ac_full)//2:].astype(float)
+        onset = self._onset_envelope()
+        onset_env = onset['onset_env']
+        if onset_env.size < 2:
+            ac = np.array([1.0, 0.0], dtype=float)
+            self._cache_time[key] = ac
+            return ac
 
-        if ac[0] > EPS:
+        # Determine max lag
+        if max_lag is None:
+            # Default: up to ~10 seconds worth of lags
+            # At 43 Hx frame rate, this is 430 frames
+            frame_rate = onset['frame_rate']
+            max_lag = min(len(onset_env) - 1, int(frame_rate*10.0))
+        else:
+            max_lag = min(max_lag, len(onset_env) - 1)
+
+        env_centered = onset_env - np.mean(onset_env)
+
+        # Compute autocorrelation 
+        ac = np.correlate(env_centered, env_centered, mode='full')
+
+        center = len(ac)//2
+        ac = ac[center:center + max_lag + 1]
+
+        # Normalize
+        if normalize and ac[0] > 0:
             ac /= ac[0]
+        else:
+            ac = np.ones(1, dtype=float)
 
-        self._cache_time["ac_onset"] = ac
-        return ac 
+        self._cache_time[key] = ac.astype(float)
+        return ac.astype(float)
+    
+    def _parabolic_interpolation(self, f: np.ndarray, x: int) -> float:
+        """
+        Sub-frame peak estimation to improve BPM precision.
+        """
+        if x <= 0 or x >= len(f) - 1:
+            return float(x)
+        
+        a, b, c = f[x - 1], f[x], f[x + 1]
+        denom = a - 2*b + c
+
+        if abs(denom) < 1e-6:
+            return float(x)
+
+        return float(x - 0.5*(a - c)/denom)
     
     def _tempo_from_onset_ac(self,
-                            bpm_min: float = 70.0,    # ✅ Tightened from 40
-                            bpm_max: float = 170.0) -> float:  # ✅ Tightened from 240
+                            bpm_min=40.0,
+                            bpm_max=240.0) -> float:
         """
         Estimate global tempo (BPM) from onset autocorrelation
+        
+        Strategy:
+        1. Compute autocorrelation of onset envelope
+        2. Find peaks in the valid BPM range
+        3. Check octave relationships (2x, 3x, 1/2, 1/3, etc.)
+        4. Select best candidate using strength + preference weighting
+        
+        Parameters
+        ----------
+        bpm_min : float
+            Minimum tempo to consider (default: 40 BPM)
+        bpm_max : float
+            Maximum tempo to consider (default: 240 BPM)
+        
+        Returns
+        -------
+        float
+            Estimated tempo in BPM
         """
+        key = f"tempo_from_onset_ac_{bpm_min}_{bpm_max}"
+        if key in self._cache_time:
+            return self._cache_time[key]
+        
+        # Get autocorrelation
         ac = self._onset_autocorrelation()
-        if ac.size < 3:
+        onset = self._onset_envelope()
+        frame_rate = onset.get('frame_rate', self.sr/float(self.H))
+
+        if ac.size < 2:
+            self._cache_time[key] = 0.0
             return 0.0
 
-        # Map BPM range to lag range
-        fs_env = self.sr / float(self.H)
+        # Convert lags to BPM
+        lags = np.arange(len(ac))
+        bpm = np.zeros_like(lags,dtype=float)
+        bpm[1:] = 60.0*frame_rate/lags[1:]
 
-        # Convert BPM bounds to lags
-        f_min = bpm_min / 60.0
-        f_max = bpm_max / 60.0
-
-        lag_min = int(fs_env / f_max)
-        lag_max = int(fs_env / f_min)
-
-        lag_min = max(lag_min, 1)
-        lag_max = min(lag_max, ac.size - 1)
-        if lag_max <= lag_min:
+        # Filter to valid range
+        mask = (bpm >= bpm_min) & (bpm <= bpm_max) & np.isfinite(bpm)
+        if not np.any(mask):
+            self._cache_time[key] = 0.0
             return 0.0
         
-        # Search for AC peaks in this lag region
-        search_region = ac[lag_min:lag_max + 1]
-        
-        peaks, properties = find_peaks(search_region, height=0.1)
+        # Find strongest peak in valid range
+        valid_ac = ac[mask]
+        valid_bpm = bpm[mask]
+        valid_lags = lags[mask]
 
-        if len(peaks) == 0:
-            rel_peak_idx = int(np.argmax(search_region))
-            tau_peak = lag_min + rel_peak_idx
-            tempo_bpm = 60 * fs_env / float(tau_peak)
-            return float(tempo_bpm)
+        peak_idx = np.argmax(valid_ac)
+        detected_bpm = valid_bpm[peak_idx]
+        detected_lag = valid_lags[peak_idx]
+        detected_strength = valid_ac[peak_idx]
 
-        # Convert peak indices to absolute lags
-        peak_lags = lag_min + peaks
-        peak_strengths = search_region[peaks]
+        # ===================================================================
+        # OCTAVE CORRECTION WITH AGGRESSIVE WEIGHTING
+        # ===================================================================
+        candidates = []
 
-        votes = {}
-        for lag, strength in zip(peak_lags, peak_strengths):
-            # Weighted candidates: prefer actual peak
-            candidates_weights = [
-                (lag,     strength * 5.0),   # ✅ Actual peak (highest weight)
-                (lag/2.0, strength * 0.2),   # Half-time (low weight)
-                (lag*2.0, strength * 0.2),   # Double-time (low weight)
-            ]
+        # Add initial detection
+        candidates.append({
+            'bpm': detected_bpm,
+            'lag': detected_lag,
+            'strength': detected_strength,
+            'label': 'initial'
+        })
 
-            for cand_lag, cand_weight in candidates_weights:
-                cand_bpm = 60.0 * fs_env / cand_lag
-                # ✅ This check now filters out-of-range half/double candidates!
-                if bpm_min <= cand_bpm <= bpm_max:
-                    cand_lag_int = int(round(cand_lag))
-                    votes.setdefault(cand_lag_int, 0.0)
-                    votes[cand_lag_int] += cand_weight
+        # Helper: find peak near a target BPM with wider search window
+        def find_peak_near(target_bpm, label, search_radius=3):
+            """
+            Find actual peak near target BPM
+            """
+            if not (bpm_min <= target_bpm <= bpm_max):
+                return
+            
+            target_lag = 60.0*frame_rate/target_bpm
+            lag_start = max(1, int(np.round(target_lag)) - search_radius)
+            lag_end = min(len(ac), int(np.round(target_lag)) + search_radius + 1)
 
-        if not votes:
-            tau_peak = peak_lags[np.argmax(peak_strengths)]
-        else:
-            tau_peak = max(votes, key=votes.get)
+            if lag_start >= lag_end:
+                return
 
-        tempo_bpm = 60.0 * fs_env / float(tau_peak)
+            # Find maximum in search window
+            search_window = ac[lag_start:lag_end]
+            local_max_idx = np.argmax(search_window)
+            actual_lag = lag_start + local_max_idx
+            actual_strength = ac[actual_lag]
+            actual_bpm = 60*frame_rate/actual_lag
 
-        # Post-processing: Octave correction
-        if 60 <= tempo_bpm < 75:
-            # Suspiciously slow - try doubling
-            doubled = tempo_bpm*2
-            if 90 <= doubled <= 180:
-                tempo_bpm = doubled
-        elif 165 < tempo_bpm <= 180:
-            # Suspiciously fast - try halving
-            halved = tempo_bpm/2
-            if 80 <= halved <= 100:
-                tempo_bpm = halved
+            candidates.append({
+                'bpm': actual_bpm,
+                'lag': actual_lag,
+                'strength': actual_strength,
+                'label': label 
+            })
 
-        return float(tempo_bpm)
+        # Check ALL octave relationships
+        find_peak_near(detected_bpm * 2.0, '2x')
+        find_peak_near(detected_bpm * 3.0, '3x')
+        find_peak_near(detected_bpm * 4.0, '4x')
+        find_peak_near(detected_bpm / 2.0, '1/2')
+        find_peak_near(detected_bpm / 3.0, '1/3')
+        find_peak_near(detected_bpm / 4.0, '1/4')
+        find_peak_near(detected_bpm * 3.0 / 2.0, '3/2')
+        find_peak_near(detected_bpm * 2.0 / 3.0, '2/3')
+
+        # ===================================================================
+        # SELECTION: MUCH STRONGER PREFERENCE FOR TYPICAL RANGE
+        # ===================================================================
+        max_strength = max(c['strength'] for c in candidates)
+
+        # Only consider candidates >= 50% of max strength
+        threshold = max_strength*0.5
+        strong_candidates = [c for c in candidates if c['strength'] >= threshold]
+
+        if not strong_candidates:
+            strong_candidates = candidates
+
+        best_score = -1
+        best_bpm = detected_bpm
+
+        for cand in strong_candidates:
+            score = cand['strength']
+
+            # ===============================================================
+            # VERY AGGRESSIVE PREFERENCE FOR TYPICAL RANGE
+            # ===============================================================
+            if 80 <= cand['bpm'] <= 160:
+                score *= 2.5 # 150% boost
+            elif 60 <= cand['bpm'] <= 180:
+                score *= 1.3 # 30% boost
+
+            # Heavy penalty for extremes
+            if cand['strength'] < max_strength*0.95:
+                if cand['bpm'] < 60:
+                    score *= 0.6 # Stronger penalty
+                if cand['bpm'] > 200:
+                    score *= 0.6 # Stronger penalty
+
+            if score > best_score:
+                best_score = score
+                best_bpm = cand['bpm']
+
+        self._cache_time[key] = float(best_bpm)
+        return float(best_bpm)
     
     def _pulse_clarity_ac(self) -> float:
         """
         Pulse clarity from dominance of main AC peak over runner-up,
         gated by absolute peak strength to suppress noise floor.
         """
-        if "pulse_clarity_ac" in self._cache_time:
-            return self._cache_time["pulse_clarity_ac"]
+        key = "pulse_clarity_ac"
+        if key in self._cache_time:
+            return self._cache_time[key]
 
         ac = self._onset_autocorrelation()
         if ac.size < 3:
-            self._cache_time["pulse_clarity_ac"] = 0.0
+            self._cache_time[key] = 0.0
             return 0.0
 
         ac_pos = ac[1:]
         if ac_pos.size == 0:
-            self._cache_time["pulse_clarity_ac"] = 0.0
+            self._cache_time[key] = 0.0
             return 0.0
 
         peaks, _ = find_peaks(ac_pos, prominence=0.01)
 
         if len(peaks) == 0:
-            self._cache_time["pulse_clarity_ac"] = 0.0
+            self._cache_time[key] = 0.0
             return 0.0
 
         top_peak = float(ac_pos[peaks].max())
@@ -861,7 +1017,7 @@ class TimeFeatures():
             clarity = top_peak/WEAK_FLOOR*0.15
 
         clarity = float(np.clip(clarity, 0.0, 1.0))
-        self._cache_time["pulse_clarity_ac"] = clarity
+        self._cache_time[key] = clarity
         return clarity
     
     def _windowed_tempo_series(self,
@@ -870,7 +1026,7 @@ class TimeFeatures():
         """ 
         Estimate tempo per window from onset envelope autocorrelation
         """
-        onset_env = self._onset_envelope()
+        onset_env = self._onset_envelope()['onset_env']
         if onset_env.size == 0:
             return np.array([], dtype=float)
         
@@ -1217,13 +1373,14 @@ class TimeFeatures():
         Higuchi fractal dimension of the time series
         Higher ~ more jagged/noise-like; 1 ~ smooth, 2 ~ rough
         """
-        if "higuchi_fd" in self._cache_time:
-            return self._cache_time["higuchi_fd"]
+        key = f"higuchi_fd_{k_max}"
+        if key in self._cache_time:
+            return self._cache_time[key]
         
         x = self.y.astype(float)
         n = len(x)  # ← Use signal length
         if n < 2 or k_max < 2:
-            self._cache_time["higuchi_fd"] = 1.0  # ← Return 1.0, not 0.0 (smooth signal)
+            self._cache_time[key] = 1.0  # ← Return 1.0, not 0.0 (smooth signal)
             return 1.0
         
         k_max = min(k_max, n - 1)
@@ -1255,12 +1412,12 @@ class TimeFeatures():
         ln_k = np.array(ln_k, dtype=float)
         
         if Lk.size < 2:
-            self._cache_time["higuchi_fd"] = 1.0  # ← Default to smooth
+            self._cache_time[key] = 1.0  # ← Default to smooth
             return 1.0
         
         # Guard against zero/negative Lk (happens for constant signals)
         if np.any(Lk <= 0):
-            self._cache_time["higuchi_fd"] = 1.0
+            self._cache_time[key] = 1.0
             return 1.0
         
         ln_Lk = np.log(Lk + EPS)
@@ -1273,7 +1430,7 @@ class TimeFeatures():
         # Clamp to valid range [1, 2]
         fd = float(np.clip(fd, 1.0, 2.0))
         
-        self._cache_time["higuchi_fd"] = fd
+        self._cache_time[key] = fd
         return fd
     
     def _hjorth_parameters(self) -> dict:
@@ -1438,494 +1595,387 @@ class TimeFeatures():
         ratio = float(low.sum())/float(ste.size)
 
         return ratio
-
-    # Spotify-based features (cached)
-    def loudness_dB(self) -> float:
-        """
-        Global loudness in dB
-        """
-        if "loudness_dB" in self._cache_time:
-            return self._cache_time["loudness_dB"]
+    
+    # Spotify-based features (Time)
+    def _spotify_loudness(self, active_only: bool = True) -> float:
+        key = f"spotify_loudness_{active_only}"
+        if key in self._cache_time:
+            return self._cache_time[key]
         
-        ldB = self._global_loudness_dB()
-        if ldB is None:
-            ldB = -80.0
+        if getattr(self, "invalid", False):
+            self._cache_time[key] = -80.0
+            return -80.0
+
+        if active_only:
+            rms = self._rms_envelope()
+            mask = self._active_rms_mask(db_threshold=-60.0)
+            if mask.size == 0 or not np.any(mask):
+                val = -80.0
+            else:
+                rms_active = np.sqrt(np.mean(rms[mask]**2)) + EPS
+                val = 20.0*np.log10(rms_active)
         else:
-            # Clamp to a sane range
-            ldB = float(np.clip(ldB, -80.0, 0.0))
+            rms = np.sqrt(np.mean(self.y**2)) + EPS
+            val = 20.0*np.log10(rms)
 
-        self._cache_time["loudness_dB"] = ldB
-        return ldB
+        val = float(max(val, -80.0))
+
+        self._cache_time[key] = val
+        return val
     
-    def loudness_norm(self) -> float:
-        """
-        Loudness mapped to [0, 1] using a fixed dB range
-        """
-        if "loudness_norm" in self._cache_time:
-            return self._cache_time["loudness_norm"]
+    def _spotify_energy(self, active_only: bool  = True) -> float:
+        key = f"spotify_energy_{active_only}"
+        if key in self._cache_time:
+            return self._cache_time[key]
         
-        ldB = self.loudness_dB()
-
-        # Clamp to [-60, 0] then normalize
-        ldB = np.clip(ldB, -60.0, 0.0)
-        ln = (ldB + 60.0)/60.0
-        ln = safe_clip01(ln)
-
-        self._cache_time["loudness_norm"] = ln
-        return ln
-    
-    def energy_partial(self) -> float:
-        """
-        Approximate Spotify "energy" using:
-        - mean active RMS
-        - dynamic range
-
-        Returns value in [0, 1], higher = more energetic
-        """
-        if "energy_partial" in self._cache_time:
-            return self._cache_time["energy_partial"]
-        
-        # Mean active RMS
-        rms_env = self._rms_envelope()
-        mask = self._active_rms_mask(db_threshold=-60.0)
-        active_rms = rms_env[mask] if mask.any() else rms_env
-        if active_rms.size == 0:
-            self._cache_time["energy_partial"] = 0.0
+        if getattr(self, "invalid", False):
+            self._cache_time[key] = 0.0
             return 0.0
         
-        mean_active_rms = float(np.mean(active_rms))
-        max_rms = float(np.max(rms_env))
-
-        # Normalize mean_active_rms by max RMS
-        rms_norm = mean_active_rms / (max_rms + EPS)
-        rms_norm = safe_clip01(rms_norm)
-
-        # Dynamic range
-        dr = float(self._dynamic_range())
-
-        # Normalize DR: 0dB -> 0, 20+dB -> ~1
-        dr_norm = safe_clip01(dr/20.0)
-
-        # Energy heuristic: combine with tunable weights
-        w_rms = 0.4
-        w_dr = 0.6
-
-        energy = w_rms*rms_norm + w_dr*dr_norm
-        energy = safe_clip01(energy)
-
-        ldB = self.loudness_dB()
-
-        # Extra: damp energy for very quiet tracks
-        if ldB <= -35.0:
-            # At -35dB -> factor ~1, at -50dB -> factor ~0
-            factor = np.clip((ldB + 50.0)/15.0, 0.0, 1.0)
-            energy *= factor * 0.9
-
-        # Live/"moderate" material with decent DR should not drop below ~0.3-0.4
-        if ldB > -30.0 and dr > 6.0 and energy < 0.3:
-            energy = 0.3
-
-        # Compressed pop pattern: loud and low DR -> ensure at least moderate energy
-        if ldB > -20.0 and dr < 6.0 and energy < 0.45:
-            energy = 0.45
-
-        # Loud constant-tone-like: very low DR -> cap energy lower
-        if ldB > -10.0 and dr < 2.0:
-            energy = min(energy, 0.40)
-
-        # If clearly acoustic, cap energy a bit lower (acoustic guitar, etc.)
-        a = self.acousticness_partial()
-        if a >= 0.6:
-            energy = min(energy, 0.65)
-
-        energy = safe_clip01(energy)
-
-        self._cache_time["energy_partial"] = energy
-        return energy
-    
-    def speechiness(self) -> float:
-        """
-        Approximate speechiness using:
-        - voiced ratio (fraction of frames with clear pitch)
-        - zcr_variance (changing spectral character)
-        - silence_ratio (pause)
-        - onset_rate (articulation)
-        """
-        if "speechiness" in self._cache_time:
-            return self._cache_time["speechiness"]
+        ste = self._short_time_energy()
+        if ste.size == 0:
+            self._cache_time[key] = 0.0
+            return 0.0
         
-        # Voiced Ratio
-        vr = float(self._voiced_ratio())
-        ur = 1.0 - vr
-
-        voiced_balance = 4.0*vr*ur
-        voiced_balance = safe_clip01(voiced_balance)
-
-        # ZCR Variance
-        zcr_var = float(self._zcr_variance())
-        zcr_var_norm = np.tanh(zcr_var)
-
-        # Silence Ratio
-        sil_ratio = float(self._silence_ratio(db_threshold=-60.0))
-
-        # Onset Rate
-        onset_rate = float(self._onset_rate())
-
-        # Typically speech 8-15 onsets/sec -> map this band to ~[0, 1]
-        onset_norm = (onset_rate - 4.0)/(16.0 - 4.0)
-        onset_norm = safe_clip01(onset_norm)
-
-        # Speechiness heuristic: combine with tunable weights
-        w_vb = 0.35
-        w_zcr = 0.20
-        w_onset = 0.25
-        w_sil = 0.20
-
-        speechiness = (
-            w_vb*voiced_balance +
-            w_zcr*zcr_var_norm +
-            w_onset*onset_norm +
-            w_sil*(sil_ratio if sil_ratio < 0.5 else (1.0 - sil_ratio))
-        )
-        speechiness = safe_clip01(speechiness)
-
-        self._cache_time["speechiness"] = speechiness
-        return speechiness
-    
-    def acousticness_partial(self) -> float:
-        """
-        Approximate acousticness using:
-        - dynamic range
-        - transient ratio
-        - silence ratio
-        - energy variance
-        - inverse loudness_norm
-        """
-        if "acousticness_partial" in self._cache_time:
-            return self._cache_time["acousticness_partial"]
-        
-        dr = float(self._dynamic_range())
-        dr_norm = safe_clip01(dr / 30.0)  # 0-30dB → 0-1
-
-        tr = float(self._transient_rate())
-        inv_tr = 1.0 - safe_clip01(tr / 15.0)
-
-        # Silence ratio from STE
-        sil_ratio = float(self._silence_ratio(db_threshold=-60.0))
-
-        # Energy variance
-        ev = float(self._energy_variance())
-        ev_norm = np.tanh(ev)
-
-        loud_norm = self.loudness_norm()
-        inv_loud = 1.0 - loud_norm
-
-        # Acousticness heuristic: combine with tunable weights
-        w_dr = 0.30
-        w_tr = 0.20
-        w_sr = 0.20
-        w_ev = 0.20
-        w_inv_ld = 0.10
-
-        acousticness = (
-            w_dr*dr_norm +
-            w_tr*inv_tr +
-            w_sr*sil_ratio +
-            w_ev*ev_norm +
-            w_inv_ld*inv_loud
-        )
-        acousticness = safe_clip01(acousticness)
-
-        self._cache_time["acousticness_partial"] = acousticness
-        return acousticness
-    
-    def danceability_partial(self) -> float:
-        """
-        Approximate danceability using:
-        - pulse clarity
-        - rhythimic stability
-        - BPM proximity (to 120 BPM)
-        - onset rate
-        - inverse silence ratio
-        """
-        if "danceability_partial" in self._cache_time:
-            return self._cache_time["danceability_partial"]
-
-        # Pulse Clarity
-        try:
-            pc = float(self._pulse_clarity_ac())
-        except AttributeError:
-            pc = 0.0
-
-        # Rhythmic Stability
-        try:
-            rs = self._rhythmic_stability()
-            stab = float(rs["stability_exp"])
-        except AttributeError:
-            stab = 1.0
-
-        # BPM Proximity: how close is the tempo to 120 BPM?
-        bpm = float(self._tempo_from_onset_ac())
-
-        # Map BPM to [0, 1], peaking around 100-140 BPM
-        if bpm <= 0:
-            bpm_score = 0.0
-        else:
-            # Triangular window: 60 BPM -> 0, 100 BPM -> 1, 120 BPM -> 1, 140 BPM -> 1, 180 BPM -> 0
-            if bpm < 60 or bpm > 180:
-                bpm_score = 0.0
-            elif bpm <= 100:
-                bpm_score = (bpm - 60.0)/(100.0 - 60.0)
-            elif bpm <= 140:
-                bpm_score = 1.0
+        if active_only:
+            mask = self._active_rms_mask(db_threshold=-60.0)
+            if mask.size == 0 or not np.any(mask):
+                avg_ste = 0.0
             else:
-                bpm_score = (180.0 - bpm)/(180.0 - 140.0)
+                avg_ste = float(np.mean(ste[mask]))
+        else:
+            avg_ste = float(np.mean(ste))
 
-        bpm_score = safe_clip01(bpm_score)
+        # Normalize intensity to a roughly 0-1 scale using sigmoid-like squash
+        intensity_score = np.tanh(avg_ste/(np.median(ste) + EPS))
 
-        # Onset Rate
-        onset_rate = float(self._onset_rate())
+        # 2. Rhythmic Activity Component (Onset Rate & Pulse Clarity)
+        # High energy tracks are usually "busier" with more transients.
+        onset_rate = self._onset_rate()
+        # Normalize onset rate (e.g., 0 to 12 onsets/sec mapped to 0-1)
+        activity_score = np.clip(onset_rate / 10.0, 0.0, 1.0)
+        
+        # 3. Complexity & Noise Component (ZCR & Hjorth Complexity)
+        # Distorted or high-frequency heavy signals (high energy) have higher ZCR.
+        zcr = np.mean(self._zero_crossing_rate())
+        zcr_score = np.clip(zcr * 5.0, 0.0, 1.0) 
 
-        # For dance, moderate to high onset rates, 1-8 onsets/sec, are typical
-        onset_norm = (onset_rate - 1.0)/(8.0 - 1.0)
-        onset_norm = safe_clip01(onset_norm)
+        # 4. Temporal Dynamics (Attack Slopes & Peak Amplitude)
+        # "Punchy" music has steeper attack slopes and higher crest factors.
+        crest_factor_values = self._crest_factor()
+        if np.ndim(crest_factor_values) > 0:
+            active_mask = self._active_rms_mask(db_threshold=-60.0)
+            active_crest = crest_factor_values[active_mask] if active_mask.size else crest_factor_values
+            crest_factor = float(np.mean(active_crest)) if active_crest.size else 0.0
+        else:
+            crest_factor = float(crest_factor_values)
 
-        # Inverse Silence Ratio
-        sil_ratio = float(self._silence_ratio(db_threshold=-60.0))
+        dynamic_score = np.clip((crest_factor - 1.0) / 10.0, 0.0, 1.0)
 
-        inv_sil = 1.0 - sil_ratio
+        # ===================================================================
+        # WEIGHTED FUSION
+        # ===================================================================
+        # Weights prioritize Intensity and Activity as the primary drivers.
+        weights = {
+            'intensity': 0.40,
+            'activity':  0.30,
+            'zcr':       0.15,
+            'dynamics':  0.15
+        }
 
-        # Danceability heuristic: combine with tunable weights
-        w_pc = 0.40
-        w_stab = 0.25
-        w_bpm = 0.15
+        energy_val = (
+            (intensity_score * weights['intensity']) +
+            (activity_score  * weights['activity']) +
+            (zcr_score       * weights['zcr']) +
+            (dynamic_score   * weights['dynamics'])
+        )
+
+        final_energy = float(np.clip(energy_val, 0.0, 1.0))
+
+        self._cache_time[key] = final_energy
+        return final_energy
+    
+    def _spotify_speechiness(self) -> float:
+        """
+        Estimate speechiness by analyzing Zero-Crossing Rate (ZCR) stability,
+        spectral complexity, and the ratio of voiced to unvoiced segments.
+        """
+        key = "spotify_speechiness"
+        if key in self._cache_time:
+            return self._cache_time[key]
+        
+        if getattr(self, "invalid", False):
+            self._cache_time[key] = 0.0
+            return 0.0
+        
+        # 1. ZCR Variance (Speech Indicator)
+        # Speech has highly varible ZCR compared to the consistent cycles of music
+        zcr = self._zero_crossing_rate()
+        zcr_var = np.var(zcr) if zcr.size > 0 else 0.0
+        # Normalize: Speech usually has higher variance than stable musical tones.
+        zcr_score = safe_clip01(zcr_var*100.0)
+
+        # 2. Vocal/Unvoiced Ratio
+        # This directly targets the phonetic components of speech
+        vocal_ratio = self._unvoiced_ratio()
+        v_u_score = safe_clip01(vocal_ratio)
+
+        # 3. Spectral Entropy/Complexity
+        # Speech is often more "complex" (less predictable) than harmonic music.
+        # We can use Hjorth Complexity or Fractal Dimension as a proxy
+        complexity = self._hjorth_parameters()["complexity"]
+        complexity_score = safe_clip01((complexity - 1.0)/5.0)
+
+        # 4. Rhythmic Stability Penalty
+        # Music is periodic; speech is not. High beat periodicity lowers speechiness.
+        periodicity = self._beat_periodicity_entropy()
+        rhythm_penalty = 1.0 - safe_clip01(periodicity)
+
+        # ===================================================================
+        # WEIGHTED FUSION
+        # ===================================================================
+        # Vocal components and ZCR variance are the strongest indicators.
+        weights = {
+            'vocal': 0.45,
+            'zcr_var': 0.25,
+            'complexity': 0.15,
+            'non_rhythmic': 0.15
+        }
+
+        speech_val = (
+            (v_u_score*weights['vocal']) + 
+            (zcr_score*weights['zcr_var']) + 
+            (complexity_score*weights['complexity']) +
+            (rhythm_penalty*weights['non_rhythmic'])
+        )
+
+        # Spotify Thresholds:
+        # > 0.66: Entirely spoken
+        # 0.33 - 0.66: Mix of speech and music (Rap)
+        # < 0.33: Mostly music
+        val = safe_clip01(speech_val)
+
+        self._cache_time[key] = val
+        return val
+
+    def _spotify_acousticness(self) -> float:
+        key = "spotify_acousticness"
+        if key in self._cache_time:
+            return self._cache_time[key]
+        
+        if getattr(self, "invalid", False):
+            self._cache_time[key] = 0.0
+            return 0.0
+        
+        rms = self._rms_envelope()
+        if rms.size < 2:
+            self._cache_time[key] = 0.0
+            return 0.0
+        
+        diffs = np.abs(np.diff(rms))
+        smoothness = 1.0 - np.mean(diffs)/(np.mean(rms) + EPS)
+
+        attack_time = self._attack_time()
+        attack_slope = self._attack_slope()
+        decay_slope = self._decay_slope()
+        silence = self._silence_ratio(db_threshold=-60.0)
+
+        attack_score = safe_clip01(attack_time/(attack_time + 0.05))
+        attack_slope_score = safe_clip01(1.0/(1.0 + abs(attack_slope)/50.0))
+        decay_score = safe_clip01(1.0/(1.0 + abs(decay_slope)/50.0))
+        smooth_score = safe_clip01(smoothness)
+        silence_score = safe_clip01(silence)
+
+        w_at = 0.20
+        w_as = 0.20
+        w_d = 0.20
+        w_sm = 0.30
+        w_ss = 0.10
+
+        val = w_sm*smooth_score + w_at*attack_score + w_as*attack_slope_score + w_d*decay_score + w_ss*silence_score
+        val = safe_clip01(val)
+
+        self._cache_time[key] = val
+        return val
+
+    def _spotify_danceability(self) -> float:
+        key = "spotify_danceability"
+        if key in self._cache_time:
+            return self._cache_time[key]
+        
+        if getattr(self, "invalid", False):
+            self._cache_time[key] = 0.0
+            return 0.0
+        
+        pulse = self._pulse_clarity_ac()
+        stability = self._rhythmic_stability()
+        periodicity = self._beat_periodicity_entropy()
+        onset_rate = self._onset_rate()
+        tempo = self._tempo_from_onset_ac()
+
+        tempo_score = safe_clip01(1.0 - abs(tempo - 120.0)/120.0)
+        onset_score = safe_clip01(onset_rate/(onset_rate + 5.0))
+        pulse_score = safe_clip01(pulse)
+        periodicity_score = safe_clip01(periodicity)
+        stability_score = safe_clip01(0.5*stability.get("stability_exp", 0.0) + 0.5*stability.get("stability_cv", 0.0))
+
+        w_temp = 0.15
         w_onset = 0.10
-        w_sil = 0.10
+        w_pulse = 0.30
+        w_per = 0.20
+        w_stab = 0.25
 
-        danceability = (
-            w_pc*pc +
-            w_stab*stab +
-            w_bpm*bpm_score +
-            w_onset*onset_norm +
-            w_sil*inv_sil
-        )
-        danceability = safe_clip01(danceability)
-        
-        # Gate on very weak pulse or stability
-        if pc < 0.15:  # More lenient threshold
-            danceability = min(danceability, 0.35)  # Higher ceiling
+        val = w_pulse*pulse_score + w_stab*stability_score + w_per*periodicity_score + w_temp*tempo_score + w_onset*onset_score
+        val = safe_clip01(val)
 
-        # Penalize highly acoustic, non-electronic material
-        a = self.acousticness_partial()
-        ldB = self.loudness_dB()
-        if a >= 0.6 and ldB > -35.0:
-            danceability *= 0.6
-
-        # Strongly reduce when tempo is unstable (rubato-like)
-        try:
-            rs = self._rhythmic_stability()
-            stab_cv = float(rs.get("stability_cv", 1.0))
-        except Exception:
-            stab_cv = 1.0
-
-        # Rubato-like: sharply reduce
-        if stab_cv < 0.6:
-            danceability *= 0.30  # was 0.35
-
-        # Live/unstable recordings: cap to moderate danceability
-        if stab_cv < 0.7:
-            danceability = min(danceability, 0.70)
-
-        # Extra clamp for clearly rubato (very unstable)
-        if stab_cv < 0.5:
-            danceability = min(danceability, 0.40)
-
-        danceability = safe_clip01(danceability)
-
-        self._cache_time["danceability_partial"] = danceability
-        return danceability
+        self._cache_time[key] = val
+        return val
     
-    def tempo_partial(self) -> float:
-        """
-        Direct wrapper for tempo_from_onset_ac, mapped to [0, 1] with a peak around 120 BPM
-        """
-        if "tempo_partial" in self._cache_time:
-            return self._cache_time["tempo_partial"]
+    def _spotify_tempo(self) -> float:
+        key = "spotify_tempo"
+        if key in self._cache_time:
+            return self._cache_time[key]
+
+        if getattr(self, "invalid", False):
+            self._cache_time[key] = 0.0
+            return 0.0
+
+        # Get primary AC estimate
+        tempo = self._tempo_from_onset_ac()
         
-        bpm = float(self._tempo_from_onset_ac())
+        # Sanity check: Use Onset Rate (transients per second)
+        # 90 BPM is 1.5 beats/sec. 180 BPM is 3 beats/sec.
+        # If onsets/sec is very high, but tempo is low, double it.
+        onsets_per_sec = self._onset_rate()
         
-        self._cache_time["tempo_partial"] = bpm
-        return bpm
-    
-    def liveness_partial(self) -> float:
-        """
-        Approximate liveness using:
-        - inverse rhythmic stability (live performances often have more tempo variation)
-        - silence ratio (live recordings may have more audience noise/silence)
-        - energy variance (live recordings may have more dynamic variation)
-        - transient ratio (live recordings may have more pronounced transients)
-        """
-        if "liveness_partial" in self._cache_time:
-            return self._cache_time["liveness_partial"]
+        if tempo < 90.0 and onsets_per_sec > 3.5:
+            # Likely an octave error (e.g., your 90 BPM vs 143 BPM error)
+            tempo *= 2.0
+        elif tempo > 160.0 and onsets_per_sec < 2.0:
+            # Likely a double-time error
+            tempo /= 2.0
+
+        final_val = float(np.clip(tempo, 40.0, 240.0))
+        self._cache_time[key] = final_val
+        return final_val
+
+    def _spotify_liveness(self) -> float:
+        key = "spotify_liveness"
+        if key in self._cache_time:
+            return self._cache_time[key]
+
+        if getattr(self, "invalid", False):
+            self._cache_time[key] = 0.0
+            return 0.0
         
-        # Rhythmic Stability
-        try:
-            rs = self._rhythmic_stability()
-            stab = float(rs.get("stability_cv", 1.0))
-        except Exception:
-            stab = 1.0
-        inv_stab = 1.0 - safe_clip01(stab)
+        trans_rate = self._transient_rate()
+        attack_time = self._attack_time()
+        attack_slope = self._attack_slope()
+        decay_slope = self._decay_slope()
+        tempo_var = self._rhythmic_stability().get("tempo_var", 0.0)
+        zcr_var = self._zcr_variance()
 
-        # Silence Ratio
-        sil_ratio = float(self._silence_ratio(db_threshold=-60.0))
+        trans_score = safe_clip01(trans_rate/(trans_rate + 3.0))
+        attack_score = safe_clip01(1.0 - attack_time/(attack_time + 0.15))
+        attack_slope_score = safe_clip01(abs(attack_slope)/(abs(attack_slope) + 20.0))
+        decay_score = safe_clip01(abs(decay_slope)/(abs(decay_slope) + 20.0))
+        tempo_var_score = safe_clip01(tempo_var/(tempo_var + 10.0))
+        zcr_score = safe_clip01(zcr_var/(1.0 + zcr_var))
 
-        # Energy Variance
-        ev = float(self._energy_variance())
-        ev_norm = np.tanh(ev)
+        w_t = 0.25
+        w_attk = 0.20
+        w_atks = 0.20
+        w_d = 0.15
+        w_tv = 0.10
+        w_zcr = 0.10
 
-        # Transient Ratio
-        tr = float(self._transient_rate())
-        tr_norm = safe_clip01(tr/10.0)
+        val = w_t*trans_score + w_attk*attack_score + w_atks*attack_slope_score + w_d*decay_score + w_tv*tempo_var_score + w_zcr*zcr_score
+        val = safe_clip01(val)
 
-        # Base liveness heuristic
-        w_stab = 0.60
-        w_sr = 0.20
-        w_ev = 0.15
-        w_tr = 0.05
+        self._cache_time[key] = val
+        return val
 
-        liveness = (
-            w_stab*inv_stab +
-            w_sr*sil_ratio +
-            w_ev*ev_norm +
-            w_tr*tr_norm
-        )
+    def _spotify_time_signature(self) -> int:
+        key = "spotify_time_signature"
+        if key in self._cache_time:
+            return self._cache_time[key]
 
-        # Extra boost for rubato-like acoustic content
-        a = self.acousticness_partial()
-        if a >= 0.5 and stab < 0.6:
-            liveness += 0.20  # was 0.15
-
-        # Live-like: not very quiet and unstable tempo -> ensure at least moderate liveness
-        ldB = self.loudness_dB()
-        if ldB > -35.0 and stab < 0.7:
-            liveness = max(liveness, 0.45)  # was 0.4
-
-        # ✅ ADD DEBUG (temporarily):
-        # print(f"[DEBUG Liveness] inv_stab={inv_stab:.3f}, sil={sil_ratio:.3f}, ev={ev_norm:.3f}, tr={tr_norm:.3f}")
+        if getattr(self, "invalid", False):
+            self._cache_time[key] = 4
+            return 4
         
-        liveness = safe_clip01(liveness)
-        
-        # ✅ ADD: Cap at 0.35 for studio recordings (based on real data)
-        if liveness > 0.35:
-            liveness = 0.35  # Studio recordings shouldn't exceed this
-            
-        self._cache_time["liveness_partial"] = liveness
-        return liveness
-    
-    def instrumentalness(self) -> float:
-        """
-        Simple complement of speechness
-        """
-        if "instrumentalness" in self._cache_time:
-            return self._cache_time["instrumentalness"]
-        
-        speech = self.speechiness()
-        instrumentalness = 1.0 - speech
-
-        instrumentalness = safe_clip01(instrumentalness)
-        self._cache_time["instrumentalness"] = instrumentalness
-        return instrumentalness
-    
-    def time_signature_partial(self) -> tuple:
-        """
-        Very rough guess of "beats per bar" using IOIs and onset AC
-
-        Returns (estimated_time_signature, confidence) where:
-        - estimated_time_signature: The guessed time signature (e.g., 4 for 4/4 time)
-        - confidence: A measure of how confident the estimate is (between 0 and 1)
-        """
-        if "time_signature_partial" in self._cache_time:
-            return self._cache_time["time_signature_partial"]
-        
-        # Get beat from tempo
-        tempo_bpm = self._tempo_from_onset_ac()
-        if tempo_bpm <= 0:
-            return (4, 0.15)
-        
-        beat_period_sec = 60.0/tempo_bpm
-
-        # Check AC for bar-level patterns
+        periodicity = self._beat_periodicity_entropy()
         ac = self._onset_autocorrelation()
         if ac.size < 3:
-            return (4, 0.15)
+            self._cache_time[key] = 4
+            return 4
         
         fs_env = self.sr/float(self.H)
+        candidate_meters = [3, 4]
+        scores = {}
 
-        # Search for bar patterns with multi-harmonic voting
-        candidates = [3, 4]
-        votes = {}
+        for meter in candidate_meters:
+            if meter == 3:
+                lag_targets = [int(round(fs_env*0.5)), int(round(fs_env*1.0)), int(round(fs_env*1.5))]
+            else:
+                lag_targets = [int(round(fs_env*0.5)), int(round(fs_env*1.0)), int(round(fs_env*2.0))]
 
-        # Adaptive window based on tempo
-        window = max(int(round(0.15*fs_env)), 5)
+            vals = []
+            for lag in lag_targets:
+                if 1 <= lag < ac.size:
+                    vals.append(ac[lag])
+            scores[meter] = float(float(np.mean(vals)) if vals else 0.0)
 
-        for m in candidates:
-            bar_period_sec = m*beat_period_sec
-            tau = int(round(bar_period_sec*fs_env))
+        meter = max(scores, key=scores.get)
+        if periodicity < 0.15:
+            meter = 4
 
-            if tau <= 0 or tau >= ac.size:
-                continue
+        self._cache_time[key] = meter
+        return meter
+    
+    def spotify_audio_features(self, weights=None) -> dict:
+        loudness = self._spotify_loudness(active_only=True)
+        energy = self._spotify_energy(active_only=True)
+        speechiness = self._spotify_speechiness()
+        acousticness = self._spotify_acousticness()
+        danceability = self._spotify_danceability()
+        tempo = self._spotify_tempo()
+        liveness = self._spotify_liveness()
+        time_signature = self._spotify_time_signature()
 
-            # Check peak at bar length
-            start = max(1, tau - window)
-            end = min(ac.size, tau + window + 1)
-            local_region = ac[start:end]
+        loudness_score = safe_clip01((loudness + 60.0)/60.0)
+        energy_score = safe_clip01(energy/(energy + 0.01))
+        tempo_score = safe_clip01(tempo/200.0)
 
-            if local_region.size == 0:
-                continue
+        vals = np.array([
+            loudness_score,
+            energy_score,
+            speechiness,
+            acousticness,
+            danceability,
+            tempo_score,
+            liveness,
+            1.0 if time_signature == 4 else 0.5 if time_signature == 3 else 0.0
+        ], dtype=float)
 
-            peak_val = float(np.max(local_region))
+        if weights is None:
+            weights = np.array([0.15, 0.15, 0.12, 0.12, 0.18, 0.14, 0.08, 0.06], dtype=float)
 
-            # Also check harmonics (2x, 3x bar length) for reinforcement
-            harmonic_bonus = 0.0
-            for harmonic in [2, 3]:
-                tau_h = int(round(harmonic*bar_period_sec*fs_env))
-                if tau_h < ac.size:
-                    start_h = max(1, tau_h - window)
-                    end_h = min(ac.size, tau_h + window + 1)
-                    if end_h > start_h:
-                        harmonic_peak = float(np.max(ac[start_h:end_h]))
-                        harmonic_bonus += harmonic_peak*0.2
+        fused = float(np.sum(vals*weights)/(np.sum(weights) + EPS))
 
-            total_strength = peak_val + harmonic_bonus
-            votes[m] = total_strength
+        return {
+            "loudness_db": loudness,
+            "energy": energy,
+            "speechiness": speechiness,
+            "acousticness": acousticness,
+            "danceability": danceability,
+            "tempo_bpm": tempo,
+            "liveness": liveness,
+            "time_signature": time_signature,
+            "spotify_fused": safe_clip01(fused)
+        }
 
-        if not votes:
-            return (4, 0.30)
-        
-        # Find best candidate
-        best_m = max(votes, key=votes.get)
-        best_conf = votes[best_m]
-
-        # Normalize confidence
-        max_ac = float(np.max(ac[1:])) if ac[1:].size > 0 else 0.0
-        conf = best_conf/max_ac if max_ac > 0 else 0.0
-        conf = safe_clip01(conf)
-
-        # Strong 3/4 penalty
-        if best_m == 3:
-            conf *= 0.60
-            if conf < 0.50:
-                return (4, 0.30)
-            
-        # Lower default threshold
-        if conf < 0.25:
-            return (4, 0.30)
-        
-        result = (best_m, conf)
-        self._cache_time["time_signature_partial"] = result
-        return result
-
-    # ---------- STFT-based features (cached) ----------
+# ---------- STFT-based features (cached) ----------
 class FrequencyFeatures():
     def __init__(self, sig: AudioSignal):
         self.y = sig.y
@@ -2028,29 +2078,26 @@ class FrequencyFeatures():
         self._cache_freq["dynamic_range"] = dr
         return dr
 
-    def _band_energy(self, bands):
+    def _band_energy(self, bands, use_power=True):
         """
         bands: list of (low_hz, high_hz) pairs
         Returns:
             band_energy: shape (n_bands, n_frames)
         """
-        key = f"band_energy_{tuple(bands)}"
+        key = f"band_energy_{tuple(bands)}_{use_power}"
         if key in self._cache_freq:
             return self._cache_freq[key]
-        
-        power = self._power_spectrum()
-        
-        band_energy = np.zeros((len(bands), power.shape[1]), dtype=float)
+
+        S = self._power_spectrum() if use_power else self._magnitude_spectrum()
+        out = np.zeros((len(bands), S.shape[1]), dtype=float)
 
         for i, (f_lo, f_hi) in enumerate(bands):
-            mask = (self.freqs >= f_lo) & (self.freqs < f_hi)
+            mask = self._safe_band_mask(f_lo, f_hi)
             if np.any(mask):
-                band_energy[i] = np.sum(power[mask, :], axis=0)
-            else:
-                band_energy[i] = 0.0
+                out[i] = np.sum(S[mask, :], axis=0)
 
-        self._cache_freq[key] = band_energy
-        return band_energy
+        self._cache_freq[key] = out
+        return out
     
     def _band_energy_ratio(self, bands):
         """
@@ -2555,31 +2602,24 @@ class FrequencyFeatures():
         self._cache_freq[key] = flux
         return flux
 
-    def _band_ratios(self, bands, relative=True):
-        """
-        Band energies ratios per frame
-
-        bands: list of (low_hz, high_hz) tuples
-
-        If relative = True:
-            returns each band's energy divided by total energy
-        If relative = False:
-            returns absolute band energies
-        """
-        key = f"band_ratios_{tuple(bands)}_{'rel' if relative else 'abs'}"
+    def _band_ratios(self, bands, use_power=True, relative=True):
+        key = f"band_ratios_{tuple(bands)}_{use_power}_{relative}"
         if key in self._cache_freq:
             return self._cache_freq[key]
 
-        band_energy = self._band_energy(bands)
+        B = self._band_energy(bands, use_power=use_power)
+        if B.size == 0:
+            self._cache_freq[key] = np.zeros((len(bands), 0), dtype=float)
+            return self._cache_freq[key]
 
         if relative:
-            total = self._frame_energy()[None, :] + EPS
-            ratios = band_energy/total
+            total = np.sum(self._power_spectrum() if use_power else self._magnitude_spectrum(), axis=0) + EPS
+            R = B / total[None, :]
         else:
-            ratios = band_energy
+            R = B
 
-        self._cache_freq[key] = ratios
-        return ratios
+        self._cache_freq[key] = R
+        return R
     
     def _low_high_band_ratio(self, low_band, high_band):
         """
@@ -3107,6 +3147,626 @@ class FrequencyFeatures():
         self._cache_freq[key] = ratio
         return ratio
     
+    # Spotify-based Frequency Features
+    def _safe_band_mask(self, f_lo, f_hi):
+        return (self.freqs >= f_lo) & (self.freqs < f_hi)
+    
+    def _sub_band_energy_ratios(self, n_bands=12, use_power=True, fmin=50.0, fmax=None):
+        key = f"sub_band_energy_ratios_{n_bands}_{'pow' if use_power else 'mag'}_{fmin}_{fmax}"
+        if key in self._cache_freq:
+            return self._cache_freq[key]
+
+        if fmax is None:
+            fmax = self.sr/2.0
+
+        edges = np.linspace(fmin, fmax, n_bands + 1)
+        bands = [(edges[i], edges[i + 1]) for i in range (n_bands)]
+        R = self._band_ratios(bands, use_power=use_power, relative=True)
+
+        self._cache_freq[key] = R
+        return R
+    
+    def _pitch_class_profile(self, use_power=True):
+        """
+        Mean energy pooled into 12 pitch classes from the STFT bins.
+        """
+        key = f"pitch_class_profile_{'pow' if use_power else 'mag'}"
+        if key in self._cache_freq:
+            return self._cache_freq[key]
+
+        S = self._power_spectrum() if use_power else self._magnitude_spectrum()
+        profile = np.zeros(12, dtype=float)
+
+        if S.size > 0:
+            for k, f in enumerate(self.freqs):
+                if f <= 0.0:
+                    continue
+                midi = 12.0 * np.log2(f / 440.0) + 69.0
+                pc = int(np.round(midi)) % 12
+                profile[pc] += float(np.mean(S[k, :]))
+
+        profile /= np.sum(profile) + EPS
+
+        self._cache_freq[key] = profile
+        return profile
+
+    def _mean_pitch_class_profile(self, n_bands=12, use_power=True):
+        key = f"mean_pitch_class_profile_{n_bands}_{'pow' if use_power else 'mag'}"
+        if key in self._cache_freq:
+            return self._cache_freq[key]
+
+        profile = self._pitch_class_profile(use_power=use_power)
+
+        self._cache_freq[key] = profile
+        return profile
+
+    def _freq_key_templates(self):
+        key = "freq_key_templates"
+        if key in self._cache_freq:
+            return self._cache_freq[key]
+
+        major_profile = np.array([
+            6.35, 2.23, 3.48, 2.33, 4.38, 4.09,
+            2.52, 5.19, 2.39, 3.66, 2.29, 2.88
+        ], dtype=float)
+        minor_profile = np.array([
+            6.33, 2.68, 3.52, 5.38, 2.60, 3.53,
+            2.54, 4.75, 3.98, 2.69, 3.34, 3.17
+        ], dtype=float)
+        major_profile /= np.sum(major_profile)
+        minor_profile /= np.sum(minor_profile)
+
+        templates = np.zeros((24, 12), dtype=float)
+        for i in range(12):
+            templates[i] = np.roll(major_profile, i)
+        for i in range(12):
+            templates[12 + i] = np.roll(minor_profile, i)
+
+        self._cache_freq[key] = templates
+        return templates
+
+    def _estimate_key_mode_freq(self):
+        key = "estimate_key_mode_freq"
+        if key in self._cache_freq:
+            return self._cache_freq[key]
+
+        profile = self._pitch_class_profile(use_power=True)
+        templates = self._freq_key_templates()
+
+        Pn = profile / (np.linalg.norm(profile) + EPS)
+        Tn = templates / (np.linalg.norm(templates, axis=1, keepdims=True) + EPS)
+        scores = Tn @ Pn
+
+        key_idx = int(np.argmax(scores))
+        result = {
+            "tonic": key_idx % 12,
+            "mode": "major" if key_idx < 12 else "minor",
+            "key_idx": key_idx,
+            "score": float(scores[key_idx]),
+        }
+
+        self._cache_freq[key] = result
+        return result
+
+    def _frequency_weights(self):
+        f = np.asarray(self.freqs, dtype=float)
+        if f.size == 0:
+            return np.array([], dtype=float)
+
+        return 1.0 + 0.5*(f/(f.max() + EPS))
+
+    def _loudness_freq_db(self):
+        key = "loudness_freq_db"
+        if key in self._cache_freq:
+            return self._cache_freq[key]
+
+        S = self._power_spectrum()
+        if S.size == 0:
+            val = -80.0
+        else:
+            P = float(np.mean(S))
+            val = float(10.0*np.log10(P + EPS))
+            val = float(max(val, -80.0))
+
+        self._cache_freq[key] = val
+        return val
+
+    def _loudness_freq_active_db(self):
+        key = "loudness_freq_active_db"
+        if key in self._cache_freq:
+            return self._cache_freq[key]
+        
+        S = self._power_spectrum()
+        if S.size == 0:
+            val = -80.0
+        else:
+            frame_energy = self._frame_energy()
+            if frame_energy.size == 0:
+                val = -80.0
+            else:
+                thr = np.median(frame_energy) + np.std(frame_energy)
+                acive = frame_energy >= thr
+                if not np.any(active):
+                    active = frame_energy > 0
+                if not np.any(active):
+                    val = -80.0
+                else:
+                    val = float(10.0*np.log10(np.mean(frame_energy[active]) + EPS))
+                    val = float(max(val, -80.0))
+
+        self._cache_freq[key] = val
+        return val
+
+    def _energy_freq(self, weighted=False):
+        key = f"energy_freq_{'weighted' if weighted else 'unweighted'}"
+        if key in self._cache_freq:
+            return self._cache_freq[key]
+
+        S = self._power_spectrum()
+        if S.size == 0:
+            self._cache_freq[key] = 0.0
+            return 0.0
+
+        fe_db = self._frame_energy_db()
+        p10_db = float(np.percentile(fe_db, 10)) if fe_db.size else -80.0
+        p50_db = float(np.percentile(fe_db, 50)) if fe_db.size else -80.0
+        p90_db = float(np.percentile(fe_db, 90)) if fe_db.size else -80.0
+
+        if weighted:
+            w = self._frequency_weights()
+            frame_level = float(np.mean(np.sum(S * w[:, None], axis=0)))
+            level_db = 10.0 * np.log10(frame_level + EPS)
+            w_level, w_act, w_crest, w_trans = 0.35, 0.40, 0.10, 0.15
+        else:
+            level_db = 0.55 * p50_db + 0.45 * p90_db
+            w_level, w_act, w_crest, w_trans = 0.15, 0.45, 0.20, 0.20
+
+        level_score = float(np.clip((level_db + 40.0) / 50.0, 0.0, 1.0))
+        crest_score = float(np.clip((p90_db - p10_db) / 40.0, 0.0, 1.0))
+
+        flux = self._spectral_flux(
+            use_power=True, normalize=True, half_wave_rectify=True
+        )
+        if flux.size > 0:
+            flux_med = float(np.median(flux)) + EPS
+            flux_mean = float(np.mean(flux))
+            flux_p95 = float(np.percentile(flux, 95))
+            activity_score = float(
+                np.clip(0.5 * flux_mean / flux_med + 0.5 * flux_p95 / flux_med, 0.0, 1.0)
+            )
+        else:
+            activity_score = 0.0
+
+        transient = self._transient_rate(
+            use_power=True, normalize=True, half_wave_rectify=True
+        )
+        transient_score = float(np.clip(transient / (transient + 3.0), 0.0, 1.0))
+
+        energy_normalized = float(
+            np.clip(
+                w_level * level_score
+                + w_act * activity_score
+                + w_crest * crest_score
+                + w_trans * transient_score,
+                0.0,
+                1.0,
+            )
+        )
+
+        self._cache_freq[key] = energy_normalized
+        return energy_normalized
+
+    def _speechiness_freq(self):
+        key = "speechiness_freq"
+        if key in self._cache_freq:
+            return self._cache_freq[key]
+
+        flat = self._spectral_flatness(use_power=True)
+        entr = self._spectral_entropy(use_power=True, normalize=True)
+        flux = self._spectral_flux(use_power=True, normalize=True, half_wave_rectify=True)
+        mid_ratio = self._band_ratios([(300.0, 3000.0)], relative=True)[0]
+        
+        z = 0.35*np.mean(flat) + 0.25*np.mean(entr) + 0.25*np.mean(np.clip(flux/(np.mean(flux) + EPS), 0.0, 1.0)) + 0.15*np.mean(mid_ratio)
+        val = safe_clip01(z)
+
+        self._cache_freq[key] = val
+        return val
+
+    def _acousticness_freq(self):
+        key = "acousticness_freq"
+        if key in self._cache_freq:
+            return self._cache_freq[key]
+
+        flat = self._spectral_flatness(use_power=True)
+        cent = self._spectral_centroid(use_power=True)
+        roll = self._spectral_rolloff(roll_percent=0.85, use_power=True)
+        slope = self._spectral_slope(use_power=True, log_amp=True)
+        harm = self._harmonic_ratio()
+        high_ratio = self._band_ratios([(6000.0, self.sr/2.0)], relative=True)[0]
+
+        c_score = 1.0 - np.mean(np.clip(cent/(self.sr/2.0), 0.0, 1.0))
+        r_score = 1.0 - np.mean(np.clip(roll/(self.sr/2.0), 0.0, 1.0))
+        s_score = 1.0 - np.mean(np.clip(np.abs(slope)/(np.abs(slope).max() + EPS), 0.0, 1.0))
+        h_score = np.mean(np.clip(harm, 0.0, 1.0))
+        high_score = 1.0 - np.mean(np.clip(high_ratio, 0.0, 1.0))
+
+        z = 0.25*np.mean(flat) + 0.20*c_score + 0.20*r_score + 0.15*s_score + 0.15*h_score + 0.05*high_score
+        val = safe_clip01(z)
+
+        self._cache_freq[key] = val
+        return val
+
+    def _danceability_freq(self):
+        key = "danceability_freq"
+        if key in self._cache_freq:
+            return self._cache_freq[key]
+
+        flux = self._spectral_flux(use_power=True, normalize=True, half_wave_rectify=True)
+        if flux.size < 10:
+            self._cache_freq[key] = 0.0
+            return 0.0
+        
+        # Detect rhythmic periodicity using autocorrelation
+        flux_centered = flux - np.mean(flux)
+        ac = np.correlate(flux_centered, flux_centered, mode="full")
+        ac = ac[ac.size//2:]
+
+        if ac[0] > 0:
+            ac = ac/ac[0]
+
+        # Look for peaks in the autocorrelation to find periodicity
+        frame_rate = self.sr/float(self.H)
+        lag_min = int(frame_rate*60/160)  # Max 160 BPM
+        lag_max = int(frame_rate*60/80)   # Min 80 BPM
+
+        if lag_min < lag_max < len(ac):
+            periodicity = float(np.max(ac[lag_min:lag_max]))
+        else:
+            periodicity = 0.0
+
+        # Flux energy (percussive has high flux)
+        flux_energy = float(np.mean(flux))
+        flux_norm = np.tanh(flux_energy*3.0)
+
+        # Combine
+        danceability = 0.7*periodicity + 0.3*flux_norm
+        danceability = float(np.clip(danceability, 0.0, 1.0))
+
+        self._cache_freq[key] = danceability
+        return danceability
+    
+    def _valence_freq(self):
+        key = "valence_freq"
+        if key in self._cache_freq:
+            return self._cache_freq[key]
+        
+        flat = self._spectral_flatness(use_power=True)
+        cent = self._spectral_centroid(use_power=True)
+        skew = self._spectral_skewness(use_power=True)
+        kurt = self._spectral_kurtosis(use_power=True, excess=True)
+        low_high = self._low_high_band_ratio((0.0, 3000.0), (3000.0, self.sr/2.0))
+
+        bright = np.mean(np.clip(cent/(self.sr/2.0), 0.0, 1.0))
+        skew_score = float(np.clip(0.5 + 0.25*np.tanh(np.mean(skew)), 0.0, 1.0))
+        kurt_score = float(np.clip(1.0 - 0.25*np.tanh(np.mean(np.abs(kurt))), 0.0, 1.0))
+
+        tonal = float(np.mean(np.clip(self._harmonic_ratio(), 0.0, 1.0)))
+        z = (
+            0.28 * bright
+            + 0.24 * (1.0 - np.mean(flat))
+            + 0.18 * skew_score
+            + 0.10 * kurt_score
+            + 0.10 * np.mean(np.clip(low_high / (low_high + 1.0), 0.0, 1.0))
+            + 0.10 * tonal
+        )
+
+        mode = self._mode_freq()
+        mode_adj = 0.03 if mode == "major" else -0.03
+
+        val = safe_clip01(z + mode_adj)
+
+        self._cache_freq[key] = val
+        return val
+
+    def _flux_implied_bpm(self, bpm_min=40.0, bpm_max=240.0):
+        """
+        Estimate tempo from median inter-onset interval in the spectral-flux envelope.
+        """
+        key = f"flux_implied_bpm_{bpm_min}_{bpm_max}"
+        if key in self._cache_freq:
+            return self._cache_freq[key]
+
+        flux = self._spectral_flux(
+            use_power=True, normalize=True, half_wave_rectify=True
+        )
+        if flux.size < 3:
+            val = 0.0
+        else:
+            fs_env = self.sr / float(self.H)
+            med = np.median(flux)
+            mad = np.median(np.abs(flux - med)) + EPS
+            peaks, _ = find_peaks(
+                flux,
+                height=med + 1.5 * mad,
+                distance=max(1, int(fs_env * 60.0 / bpm_max)),
+            )
+            if peaks.size < 2:
+                val = 0.0
+            else:
+                ibi = np.diff(peaks) / fs_env
+                ibi = ibi[(ibi >= 60.0 / bpm_max) & (ibi <= 60.0 / bpm_min)]
+                if ibi.size == 0:
+                    val = 0.0
+                else:
+                    fast_ibi = float(np.percentile(ibi, 25))
+                    ibi_bpm = float(np.clip(60.0 / fast_ibi, bpm_min, bpm_max))
+
+                    lo = max(1, int(round(fs_env * 0.25)))
+                    ac_seg = np.correlate(
+                        flux - np.mean(flux), flux - np.mean(flux), mode="full"
+                    )
+                    ac_seg = ac_seg[ac_seg.size // 2 :]
+                    hi = min(int(round(fs_env * 1.0)), ac_seg.size - 1)
+                    if hi > lo and ac_seg.size > hi and ac_seg[0] > 0:
+                        ac_seg = ac_seg / ac_seg[0]
+                        seg = ac_seg[lo : hi + 1]
+                        seg_peaks, _ = find_peaks(seg, height=0.25 * float(np.max(seg)))
+                        if seg_peaks.size:
+                            ac_bpm = float(
+                                np.clip(60.0 * fs_env / float(lo + int(seg_peaks[0])), bpm_min, bpm_max)
+                            )
+                        else:
+                            ac_bpm = float(
+                                np.clip(
+                                    60.0 * fs_env / float(lo + int(np.argmax(seg))),
+                                    bpm_min,
+                                    bpm_max,
+                                )
+                            )
+                    else:
+                        ac_bpm = ibi_bpm
+
+                    if ibi_bpm > 0.0 and ac_bpm > 0.0:
+                        lo_bpm = min(ibi_bpm, ac_bpm)
+                        hi_bpm = max(ibi_bpm, ac_bpm)
+                        val = hi_bpm if hi_bpm > 1.45 * lo_bpm else 0.5 * (ibi_bpm + ac_bpm)
+                    else:
+                        val = max(ibi_bpm, ac_bpm)
+
+                    val = float(np.clip(val, bpm_min, bpm_max))
+
+        self._cache_freq[key] = val
+        return val
+    
+    def _tempo_freq(self):
+        key = "tempo_freq"
+        if key in self._cache_freq:
+            return self._cache_freq[key]
+
+        flux = self._spectral_flux(
+            use_power=True, normalize=True, half_wave_rectify=True
+        )
+        if flux.size < 3:
+            self._cache_freq[key] = 0.0
+            return 0.0
+
+        x = flux - np.mean(flux)
+        ac = np.correlate(x, x, mode="full")
+        ac = ac[ac.size // 2 :]
+        if ac.size < 3 or ac[0] <= 0:
+            self._cache_freq[key] = 0.0
+            return 0.0
+
+        ac = ac / ac[0]
+
+        fs_env = self.sr / float(self.H)
+        bpm_min, bpm_max = 40.0, 240.0
+        lag_min = max(1, int(round(fs_env / (bpm_max / 60.0))))
+        lag_max = min(ac.size - 1, int(round(fs_env / (bpm_min / 60.0))))
+        if lag_max <= lag_min:
+            self._cache_freq[key] = 0.0
+            return 0.0
+
+        region = ac[lag_min : lag_max + 1]
+        peak_height = 0.25 * float(np.max(region))
+        min_distance = max(1, int(round(fs_env * 60.0 / bpm_max)))
+        peaks, _ = find_peaks(region, height=peak_height, distance=min_distance)
+
+        if peaks.size:
+            tau = lag_min + int(peaks[0])
+        else:
+            tau = lag_min + int(np.argmax(region))
+
+        def _ac_at_lag(lag):
+            lag = int(lag)
+            if lag <= 0 or lag >= len(ac):
+                return 0.0
+            tol = max(2, int(round(lag * 0.08)))
+            s = max(0, lag - tol)
+            e = min(len(ac), lag + tol + 1)
+            return float(np.max(ac[s:e])) if s < e else 0.0
+
+        bpm = float(60.0 * fs_env / float(tau + EPS))
+
+        # Upgrade to faster octave when half-period correlation is stronger
+        half_tau = tau // 2
+        if half_tau >= lag_min and _ac_at_lag(half_tau) > _ac_at_lag(tau):
+            bpm = float(60.0 * fs_env / float(half_tau + EPS))
+
+        val = float(np.clip(bpm, bpm_min, bpm_max))
+        self._cache_freq[key] = val
+        return val
+    
+    def _liveness_freq(self):
+        key = "liveness_freq"
+        if key in self._cache_freq:
+            return self._cache_freq[key]
+        
+        flux = self._spectral_flux(use_power=True, normalize=True, half_wave_rectify=True)
+        transient = self._transient_rate(use_power=True, normalize=True, half_wave_rectify=True)
+        high_noise = np.mean(self._band_ratios([(4000.0, self.sr/2.0)], relative=True)[0])
+        flat = np.mean(self._spectral_flatness(use_power=True))
+        slope = np.mean(np.abs(self._spectral_slope(use_power=True, log_amp=True)))
+
+        z = 0.30*float(np.clip(transient/(transient + 5.0), 0.0, 1.0)) + 0.20*float(np.clip(np.mean(flux)/(np.mean(flux) + 1.0), 0.0, 1.0)) + 0.20*high_noise + 0.15*flat + 0.15*float(np.clip(slope/(slope + 10.0), 0.0, 1.0))
+        val = safe_clip01(z)
+
+        self._cache_freq[key] = val
+        return val
+    
+    def _instrumentalness_freq(self):
+        key = "instrumentalness_freq"
+        if key in self._cache_freq:
+            return self._cache_freq[key]
+
+        flat = np.mean(self._spectral_flatness(use_power=True))
+        hnr = self._harmonic_ratio()
+        hnr_mean = float(np.mean(hnr)) if np.size(hnr) else 0.0
+        inh = self._inharmonicity()
+        inh_mean = float(np.mean(inh)) if np.size(inh) else 0.0
+        voiced_band = np.mean(self._band_ratios([(300.0, 3400.0)], relative=True)[0])
+
+        z = 0.35*(1.0 - flat) + 0.25*hnr_mean + 0.20*(1.0 - float(np.clip(inh_mean/(inh_mean + 1.0), 0.0, 1.0))) + 0.20*(1.0 - voiced_band)
+        val = safe_clip01(z)
+
+        self._cache_freq[key] = val
+        return val
+
+    def _key_freq(self):
+        key = "key_freq"
+        if key in self._cache_freq:
+            return self._cache_freq[key]
+
+        tonic = self._estimate_key_mode_freq()["tonic"]
+
+        self._cache_freq[key] = tonic
+        return tonic
+
+    def _mode_freq(self):
+        key = "mode_freq"
+        if key in self._cache_freq:
+            return self._cache_freq[key]
+
+        mode = self._estimate_key_mode_freq()["mode"]
+
+        self._cache_freq[key] = mode
+        return mode
+    
+    def _time_signature_freq(self):
+        key = "time_signature_freq"
+        if key in self._cache_freq:
+            return self._cache_freq[key]
+
+        periodicity = self._beat_periodicity(use_power=True, normalize=True, half_wave_rectify=True)
+    
+        # If no clear beat, default to 4/4
+        if periodicity < 0.15:
+            self._cache_freq[key] = 4
+            return 4
+        
+        flux = self._spectral_flux(use_power=True, normalize=True, half_wave_rectify=True)
+        if flux.size < 10:
+            self._cache_freq[key] = 4
+            return 4
+        
+        # Autocorrelation of flux
+        ac = np.correlate(flux - np.mean(flux), flux - np.mean(flux), mode="full")
+        ac = ac[ac.size // 2:]
+        
+        if ac[0] > 0:
+            ac = ac / ac[0]
+        
+        fs_env = self.sr / float(self.H)
+        
+        # For 3/4 vs 4/4 discrimination:
+        # 3/4 has emphasis every 3 beats
+        # 4/4 has emphasis every 2 or 4 beats
+        
+        # Check at different beat multiples
+        # Assuming typical tempo ~120 BPM = 2 beats/sec
+        
+        # 3-beat pattern (3/4): check at 1.5 beat intervals
+        lag_3beat = int(round(fs_env * 0.75))  # 3/4 of a second at 120 BPM
+        score3 = ac[lag_3beat] if lag_3beat < ac.size else 0.0
+        
+        # 4-beat pattern (4/4): check at 2 beat intervals (backbeat)
+        lag_4beat = int(round(fs_env * 1.0))  # 1 second at 120 BPM
+        score4 = ac[lag_4beat] if lag_4beat < ac.size else 0.0
+        
+        # Also check at measure level
+        lag_3measure = int(round(fs_env * 1.5))  # Full 3/4 measure
+        score3_measure = ac[lag_3measure] if lag_3measure < ac.size else 0.0
+        
+        lag_4measure = int(round(fs_env * 2.0))  # Full 4/4 measure
+        score4_measure = ac[lag_4measure] if lag_4measure < ac.size else 0.0
+        
+        # Combine scores
+        total_score3 = score3 + score3_measure
+        total_score4 = score4 + score4_measure
+        
+        # Need clear preference for 3/4 (since 4/4 is more common)
+        val = 3 if total_score3 > total_score4 * 1.1 else 4
+        
+        self._cache_freq[key] = val
+        return val
+
+    def spotify_audio_features(self, weights=None):
+        loudness = self._loudness_freq_db()
+        energy = self._energy_freq(weighted=True)
+        speechiness = self._speechiness_freq()
+        acousticness = self._acousticness_freq()
+        danceability = self._danceability_freq()
+        valence = self._valence_freq()
+        tempo = self._tempo_freq()
+        liveness = self._liveness_freq()
+        instrumentalness = self._instrumentalness_freq()
+        key = self._key_freq()
+        mode = self._mode_freq()
+        time_signature = self._time_signature_freq()
+
+        loudness_score = safe_clip01((loudness + 80.0) / 80.0)
+        energy_score = safe_clip01(energy / (energy + 1.0))
+        tempo_score = safe_clip01(tempo / 240.0)
+        key_score = safe_clip01(key / 11.0)
+        mode_score = 1.0 if mode == "major" else 0.0
+        time_sig_score = 1.0 if time_signature == 4 else 0.5 if time_signature == 3 else 0.0
+
+        vals = np.array([
+            loudness_score,
+            energy_score,
+            speechiness,
+            acousticness,
+            danceability,
+            valence,
+            tempo_score,
+            liveness,
+            instrumentalness,
+            key_score,
+            mode_score,
+            time_sig_score,
+        ], dtype=float)
+
+        if weights is None:
+            weights = np.array([0.12, 0.12, 0.08, 0.10, 0.12, 0.08, 0.08, 0.10, 0.12, 0.06, 0.05, 0.07], dtype=float)
+
+        fused = float(np.sum(vals * weights) / (np.sum(weights) + EPS))
+
+        return {
+            "loudness_db": loudness,
+            "energy": energy,
+            "speechiness": speechiness,
+            "acousticness": acousticness,
+            "danceability": danceability,
+            "valence": valence,
+            "tempo_bpm": tempo,
+            "liveness": liveness,
+            "instrumentalness": instrumentalness,
+            "key": key,
+            "mode": mode,
+            "time_signature": time_signature,
+            "spotify_fused": float(np.clip(fused, 0.0, 1.0)),
+        }
+    
 # Chromagram class
 class ChromagramFeatures():
     def __init__(self, sig: AudioSignal):
@@ -3436,79 +4096,6 @@ class ChromagramFeatures():
         return labels
     
     # Tonality/Chord
-    def _key_estimation(self, normalize=True, use_db=False, method="cosine"):
-        """
-        Estimate the key of the audio signal
-        Returns:
-            key_idx: index of estimated key in template_labels (0-23)
-            tonic: pitch class of tonic (0-11)
-            mode: "maj" or "min"
-            score: cosine similarity score of best matching template
-            scores: array of cosine similarity scores for all templates
-        """
-        key = f"key_estimation_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}_{method}"
-        if key in self._cache_chroma:
-            return self._cache_chroma[key]
-        
-        P = self._mean_chroma(normalize=normalize, use_db=use_db)
-        T = self._chroma_template()
-
-        if method == "cosine":
-            Pn = P/(np.linalg.norm(P) + EPS)
-            Tn = T/(np.linalg.norm(T, axis=1, keepdims=True) + EPS)
-            scores = Tn @ Pn
-        elif method == "dot":
-            scores = T @ P
-        else:
-            raise ValueError(f"Unsupported method: {method}")
-        
-        key_idx = int(np.argmax(scores))
-        tonic = key_idx%12
-        mode = "maj" if key_idx < 12 else "min"
-        score = float(scores[key_idx])
-
-        result = {
-            "key_idx": key_idx,
-            "tonic": tonic,
-            "mode": mode,
-            "score": score,
-            "scores": scores
-        }
-
-        self._cache_chroma[key] = result
-        return result
-    
-    def _mode_classification(self, normalize=True, use_db=False, method="cosine"):
-        """
-        Classify the mode (major vs minor) of the audio signal
-        Returns:
-            mode string: "maj" or "min"
-            score_major: float score for best matching major template
-            score_minor: float score for best matching minor template
-            delta_score: score_major - score_minor, higher = more major-like, lower = more minor-like
-        """
-        key = f"mode_classification_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}_{method}"
-        if key in self._cache_chroma:
-            return self._cache_chroma[key]
-        
-        result = self._key_estimation(normalize=normalize, use_db=use_db, method=method)
-        tonic = result["tonic"]
-        score_major = result["scores"][tonic]
-        score_minor = result["scores"][tonic + 12]
-        delta_score = score_major - score_minor
-
-        mode = "maj" if delta_score >= 0 else "min"
-
-        result = {
-            "mode": mode,
-            "score_major": score_major,
-            "score_minor": score_minor,
-            "delta_score": delta_score
-        }
-
-        self._cache_chroma[key] = result
-        return result
-    
     def _tonal_clarity(self, normalize=True, use_db=False, method="cosine"):
         """
         A simple tonal clarity measure based on the best key estimation score normalized by the mean score
@@ -3972,6 +4559,361 @@ class ChromagramFeatures():
         self._cache_chroma[key] = result
         return result
 
+    # Spotify-based Features + Helpers
+    def _mean_chroma_profile(self, normalize=True, use_db=False):
+        key = f"mean_chroma_profile_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}"
+        if key in self._cache_chroma:
+            return self._cache_chroma[key]
+        
+        P = self._chroma_profile(normalize=normalize, use_db=use_db)
+        prof = np.mean(P, axis=1) if P.size else np.zeros(12, dtype=float)
+
+        self._cache_chroma[key] = prof
+        return prof
+    
+    def _chroma_entropy(self, normalize=True, use_db=False):
+        key = f"chroma_entropy_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}"
+        if key in self._cache_chroma:
+            return self._cache_chroma[key]
+        
+        P = self._chroma_profile(normalize=normalize, use_db=use_db)
+        if P.size == 0:
+            self._cache_chroma[key] = 0.0
+            return 0.0
+        
+        p = P/(np.sum(P, axis=0, keepdims=True) + EPS)
+        H = -np.sum(p*np.log2(p + EPS), axis=0)
+        val = float(np.mean(H)/np.log2(12))
+        val = float(np.clip(val, 0.0, 1.0))
+
+        self._cache_chroma[key] = val
+        return val
+
+    def _chroma_flux_mean(self, normalize=True, use_db=False):
+        key = f"chroma_flux_mean_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}"
+        if key in self._cache_chroma:
+            return self._cache_chroma[key]
+
+        P = self._chroma_profile(normalize=normalize, use_db=use_db)
+        if P.shape[1] < 2:
+            self._cache_chroma[key] = 0.0
+            return 0.0
+
+        d = np.diff(P, axis=1)
+        val = float(np.mean(np.linalg.norm(d, axis=0)))
+
+        self._cache_chroma[key] = val
+        return val
+    
+    def _chroma_flux_variance(self, normalize=True, use_db=False):
+        key = f"chroma_flux_variance_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}"
+        if key in self._cache_chroma:
+            return self._cache_chroma[key]
+
+        P = self._chroma_profile(normalize=normalize, use_db=use_db)
+        if P.shape[1] < 2:
+            self._cache_chroma[key] = 0.0
+            return 0.0
+
+        d = np.linalg.norm(np.diff(P, axis=1), axis=0)
+        val = float(np.var(d))
+
+        self._cache_chroma[key] = val
+        return val
+
+    def _harmonic_template_fit(self, normalize=True, use_db=False, method="cosine"):
+        key = f"harmonic_template_fit_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}_{method}"
+        if key in self._cache_chroma:
+            return self._cache_chroma[key]
+
+        P = self._mean_chroma_profile(normalize=normalize, use_db=use_db)
+        T = self._chroma_template()["templates"][:, :12]
+
+        if method == "cosine":
+            Pn = P/(np.linalg.norm(P) + EPS)
+            Tn = T/(np.linalg.norm(T, axis=1, keepdims=True) + EPS)
+            scores = Tn @ Pn
+        elif method == "dot":
+            scores = T @ P
+        else:
+            raise ValueError("method must be 'cosine' or 'dot'")
+
+        best = float(np.max(scores)) if scores.size else 0.0
+        result = {
+            "best_score": best,
+            "scores": scores,
+            "best_idx": int(np.argmax(scores)) if scores.size else 0
+        }
+
+        self._cache_chroma[key] = result
+        return result
+
+    def _tonal_stability(self, normalize=True, use_db=False):
+        key = f"tonal_stability_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}"
+        if key in self._cache_chroma:
+            return self._cache_chroma[key]
+
+        smooth = self._chroma_smoothness(normalize=normalize, use_db=use_db, metric="l2")["smoothness"]
+        clarity = self._tonal_clarity(normalize=normalize, use_db=use_db, method="cosine")["tonal_clarity"]
+
+        val = float(np.clip(0.5*smooth + 0.5*clarity, 0.0, 1.0))
+
+        self._cache_chroma[key] = val
+        return val
+    
+    def _chroma_repetition(self, normalize=True, use_db=False):
+        key = f"chroma_repetition_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}"
+        if key in self._cache_chroma:
+            return self._cache_chroma[key]
+
+        ac = self._chroma_autocorrelation(lag_max=64,normalize=normalize, use_db=use_db)["acf_mean"]
+        if ac.size < 2:
+            self._cache_chroma[key] = 0.0
+            return 0.0
+        
+        region = ac[1:]
+        val = float(np.clip(np.max(region), 0.0, 1.0)) if region.size else 0.0
+
+        self._cache_chroma[key] = val
+        return val
+
+    def _pitch_class_peakedness(self, normalize=True, use_db=False):
+        key = f"pitch_class_peakedness_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}"
+        if key in self._cache_chroma:
+            return self._cache_chroma[key]
+
+        P = self._mean_chroma_profile(normalize=normalize, use_db=use_db)
+        if P.size == 0:
+            self._cache_chroma[key] = 0.0
+            return 0.0
+
+        p = P/(np.sum(P) + EPS)
+        val = float(np.clip(np.max(p)/(np.mean(p) + EPS), 0.0, 12.0)/12.0)
+
+        self._cache_chroma[key] = val
+        return val
+    
+    def _key_estimation(self, normalize=True, use_db=False, method="cosine"):
+        """
+        Estimate the key of the audio signal
+        Returns:
+            key_idx: index of estimated key in template_labels (0-23)
+            tonic: pitch class of tonic (0-11)
+            mode: "maj" or "min"
+            score: cosine similarity score of best matching template
+            scores: array of cosine similarity scores for all templates
+        """
+        key = f"key_estimation_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}_{method}"
+        if key in self._cache_chroma:
+            return self._cache_chroma[key]
+        
+        P = self._mean_chroma(normalize=normalize, use_db=use_db)
+        T = self._chroma_template()
+
+        if method == "cosine":
+            Pn = P/(np.linalg.norm(P) + EPS)
+            Tn = T/(np.linalg.norm(T, axis=1, keepdims=True) + EPS)
+            scores = Tn @ Pn
+        elif method == "dot":
+            scores = T @ P
+        else:
+            raise ValueError(f"Unsupported method: {method}")
+        
+        key_idx = int(np.argmax(scores))
+        tonic = key_idx%12
+        mode = "maj" if key_idx < 12 else "min"
+        score = float(scores[key_idx])
+
+        result = {
+            "key_idx": key_idx,
+            "tonic": tonic,
+            "mode": mode,
+            "score": score,
+            "scores": scores
+        }
+
+        self._cache_chroma[key] = result
+        return result
+    
+    def _energy_chroma(self, normalize=True, use_db=False):
+        key = f"energy_chroma_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}"
+        if key in self._cache_chroma:
+            return self._cache_chroma[key]
+
+        fit = self._harmonic_template_fit(normalize=normalize, use_db=use_db, method="dot")["best_score"]
+        spread = self._chroma_spread(normalize=normalize, use_db=use_db)
+        stability = self._tonal_stability(normalize=normalize, use_db=use_db)
+
+        val = safe_clip01(0.35*fit + 0.35*stability + 0.3*(1.0 - np.mean(spread)))
+
+        self._cache_chroma[key] = val
+        return val
+
+    def _speechiness_chroma(self, normalize=True, use_db=False):
+        key = f"speechiness_chroma_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}"
+        if key in self._cache_chroma:
+            return self._cache_chroma[key]
+
+        ent = self._chroma_entropy(normalize=normalize, use_db=use_db)
+        flux = self._chroma_flux_mean(normalize=normalize, use_db=use_db)
+        var = self._chroma_flux_variance(normalize=normalize, use_db=use_db)
+        repetitive = self._chroma_repetition(normalize=normalize, use_db=use_db)
+
+        val = safe_clip01(0.4*ent + 0.25*np.tanh(flux) + 0.20*np.tanh(var) + 0.15*(1.0 - repetitive))
+
+        self._cache_chroma[key] = val
+        return val
+
+    def _acousticness_chroma(self, normalize=True, use_db=False):
+        key = f"acousticness_chroma_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}"
+        if key in self._cache_chroma:
+            return self._cache_chroma[key]
+
+        fit = self._harmonic_template_fit(normalize=normalize, use_db=use_db, method="dot")["best_score"]
+        stability = self._tonal_stability(normalize=normalize, use_db=use_db)
+        entropy = self._chroma_entropy(normalize=normalize, use_db=use_db)
+        flux = self._chroma_flux_mean(normalize=normalize, use_db=use_db)
+
+        val = safe_clip01(0.35*fit + 0.30*stability + 0.20*(1.0 - entropy) + 0.15*(1.0 - np.tanh(flux)))
+
+        self._cache_chroma[key] = val
+        return val
+    
+    def _danceability_chroma(self, normalize=True, use_db=False):
+        key = f"danceability_chroma_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}"
+        if key in self._cache_chroma:
+            return self._cache_chroma[key]
+
+        rep = self._chroma_repetition(normalize=normalize, use_db=use_db)
+        smooth = self._chroma_smoothness(normalize=normalize, use_db=use_db, metric="l2")["smoothness"]
+        stability = self._tonal_stability(normalize=normalize, use_db=use_db)
+        flux = self._chroma_flux_mean(normalize=normalize, use_db=use_db)
+
+        val = safe_clip01(0.35*rep + 0.25*smooth + 0.20*stability + 0.20*(1.0 - np.tanh(flux)))
+
+        self._cache_chroma[key] = val
+        return val
+    
+    def _valence_chroma(self, normalize=True, use_db=False):
+        key = f"valence_chroma_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}"
+        if key in self._cache_chroma:
+            return self._cache_chroma[key]
+        
+        prof = self._mean_chroma_profile(normalize=normalize, use_db=use_db)
+        if prof.size == 0:
+            self._cache_chroma[key] = 0.5
+            return 0.5
+        
+        major_template = np.array([
+            [1, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0]
+        ])
+        major = self._mode_classification(normalize=normalize, use_db=use_db, method="cosine")["mode"] == "maj"
+        key_res = self._key_estimation(normalize=normalize, use_db=use_db, method="cosine")
+        tonic = key_res["tonic"]
+        templates = self._chroma_template()["templates"]
+        maj_score = float(key_res["scores"][tonic])
+        min_score = float(key_res["scores"][tonic + 12])
+        clarity = self._tonal_clarity(normalize=normalize, use_db=use_db, method="cosine")["tonal_clarity"]
+        fit = self._harmonic_template_fit(normalize=normalize, use_db=use_db, method="cosine")["best_score"]
+        bright = float((prof[(tonic + 4)%12] + prof[(tonic + 7)%12] + prof[(tonic + 11)%12])/(np.sum(prof) + EPS))
+        delta = maj_score - min_score
+
+        val = safe_clip01(0.40*(0.5 + 0.5*np.tanh(delta)) + 0.25*clarity + 0.20*fit + 0.15*bright)
+
+        self._cache_chroma[key] = val
+        return val
+    
+    def _tempo_chroma(self, normalize=True, use_db=False):
+        key = f"tempo_chroma_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}"
+        if key in self._cache_chroma:
+            return self._cache_chroma[key]
+        
+        rep = self._chroma_repetition(normalize=normalize, use_db=use_db)
+        flux = self._chroma_flux_mean(normalize=normalize, use_db=use_db)
+        var = self._chroma_flux_variance(normalize=normalize, use_db=use_db)
+
+        tempo_proxy = float(np.clip(40.0 + 200.0*(0.45*rep + 0.35*np.tanh(flux) + 0.20*np.tanh(var)), 40.0, 240.0))
+
+        self._cache_chroma[key] = tempo_proxy
+        return tempo_proxy
+    
+    def _instrumentalness_chroma(self, normalize=True, use_db=False):
+        key = f"instrumentalness_chroma_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}"
+        if key in self._cache_chroma:
+            return self._cache_chroma[key]
+
+        fit = self._harmonic_template_fit(normalize=normalize, use_db=use_db, method="dot")["best_score"]
+        stability = self._tonal_stability(normalize=normalize, use_db=use_db)
+        entropy = self._chroma_entropy(normalize=normalize, use_db=use_db)
+        tonal_focus = self._pitch_class_peakedness(normalize=normalize, use_db=use_db)
+
+        val = safe_clip01(0.35*fit + 0.25*stability + 0.20*tonal_focus + 0.20*(1.0 - entropy))
+
+        self._cache_chroma[key] = val
+        return val
+
+    def _time_signature_chroma(self, normalize=True, use_db=False):
+        key = f"time_signature_chroma_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}"
+        if key in self._cache_chroma:
+            return self._cache_chroma[key]
+
+        rep = self._chroma_repetition(normalize=normalize, use_db=use_db)
+        flux = self._chroma_flux_mean(normalize=normalize, use_db=use_db)
+        smooth = self._chroma_smoothness(normalize=normalize, use_db=use_db, metric="l2")["smoothness"]
+
+        meter_score = safe_clip01(0.5*rep + 0.3*smooth + 0.2*(1.0 - np.tanh(flux)))
+        ts = 3 if meter_score > 0.55 else 4
+
+        self._cache_chroma[key] = ts
+        return ts
+
+    def _mode_classification(self, normalize=True, use_db=False, method="cosine"):
+        """
+        Classify the mode (major vs minor) of the audio signal
+        Returns:
+            mode string: "maj" or "min"
+            score_major: float score for best matching major template
+            score_minor: float score for best matching minor template
+            delta_score: score_major - score_minor, higher = more major-like, lower = more minor-like
+        """
+        key = f"mode_classification_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}_{method}"
+        if key in self._cache_chroma:
+            return self._cache_chroma[key]
+        
+        result = self._key_estimation(normalize=normalize, use_db=use_db, method=method)
+        tonic = result["tonic"]
+        score_major = result["scores"][tonic]
+        score_minor = result["scores"][tonic + 12]
+        delta_score = score_major - score_minor
+
+        mode = "maj" if delta_score >= 0 else "min"
+
+        result = {
+            "mode": mode,
+            "score_major": score_major,
+            "score_minor": score_minor,
+            "delta_score": delta_score
+        }
+
+        self._cache_chroma[key] = result
+        return result
+    
+    def spotify_audio_features(self, normalize=True, use_db=False, method="cosine"):
+        key_res = self._key_estimation(normalize=normalize, use_db=use_db, method=method)
+        mode_res = self._mode_classification(normalize=normalize, use_db=use_db, method=method)
+
+        return {
+            "energy": self._energy_chroma(normalize=normalize, use_db=use_db),
+            "speechiness": self._speechiness_chroma(normalize=normalize, use_db=use_db),
+            "acousticness": self._acousticness_chroma(normalize=normalize, use_db=use_db),
+            "danceability": self._danceability_chroma(normalize=normalize, use_db=use_db),
+            "valence": self._valence_chroma(normalize=normalize, use_db=use_db),
+            "tempo": self._tempo_chroma(normalize=normalize, use_db=use_db),
+            "instrumentalness": self._instrumentalness_chroma(normalize=normalize, use_db=use_db),
+            "key": key_res["key"],
+            "mode": mode_res["mode"],
+            "time_signature": self._time_signature_chroma(normalize=normalize, use_db=use_db),
+        }
 
 class TempogramFeatures:
     def __init__(self, sig, center=True):
@@ -5449,6 +6391,213 @@ class TempogramFeatures:
         self._cache_tempogram[key] = result
         return result
     
+    # Spotify-based Tempogram features
+    def _beat_periodic_energy(self, bpm_min=40.0, bpm_max=240.0, norm_sum=True):
+        key = f"beat_periodic_energy_{bpm_min}_{bpm_max}_{norm_sum}"
+        if key in self._cache_tempogram:
+            return self._cache_tempogram[key]
+
+        spec = self._tempo_spectrum(win_length=self.N, center=self.center, window="hann")
+        S = spec["spectrum"]
+        bpm = spec["bpm"]
+
+        if S.size == 0:
+            out = np.array([], dtype=float)
+        else:
+            mask = (bpm >= bpm_min) & (bpm <= bpm_max) & np.isfinite(bpm)
+            out = S[mask]
+
+        self._cache_tempogram[key] = out
+        return out
+
+    def _loudness_tempogram_per_beat(self, beat_times=None, beat_frames=None):
+        key = f"loudness_tempogram_per_beat_{beat_times is not None}_{beat_frames is not None}"
+        if key in self._cache_tempogram:
+            return self._cache_tempogram[key]
+        
+        onset = self._onset_strength()
+        env = onset["onset_env"]
+        times = onset["times"]
+
+        if beat_times is None:
+            if beat_frames is None:
+                g = self._global_bpm()
+                if g["bpm"] <= 0 or times.size < 2:
+                    out = np.array([], dtype=float)
+                    self._cache_tempogram[key] = out
+                    return out
+                beat_period = 60.0/g["bpm"]
+                beat_times = np.arange(times[0], times[-1] + beat_period, beat_period)
+            else:
+                beat_times = self._beat_time_from_frames(beat_frames)
+
+        beat_times = np.asarray(beat_times, dtype=float)
+        if beat_times.size == 0:
+            out = np.array([], dtype=float)
+            self._cache_tempogram[key] = out
+            return out
+
+        vals = np.zeros(beat_times.size, dtype=float)
+        half_win = 0.5*(np.median(np.diff(beat_times)) if beat_times.size > 1 else (self.H/float(self.sr)))
+
+        for i, bt in enumerate(beat_times):
+            lo = bt - half_win
+            hi = bt + half_win
+            mask = (times >= lo) & (times< hi)
+            if np.any(mask):
+                vals[i] = float(np.mean(env[mask]))
+            else:
+                idx = int(np.argmin(np.abs(times - bt)))
+                vals[i] = float(env[idx])
+
+        self._cache_tempogram[key] = vals
+        return vals
+
+    def _danceability_tempogram(self, bpm_min=40.0, bpm_max=240.0, norm_sum=True):
+        key = f"danceability_tempogram_{bpm_min}_{bpm_max}_{norm_sum}"
+        if key in self._cache_tempogram:
+            return self._cache_tempogram[key]
+        
+        pulse = self._pulse_clarity(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum)["clarity"]
+        stab = self._tempo_stability_index(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum)["stability"]
+        beat_strength = self._beat_strength(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum)["strength"]
+        multi = self._multi_periodic_structure(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum)["multi_periodicity"]
+        var = self._beat_fluctuation_rate(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum)
+
+        val = float(np.clip(
+            0.30*pulse +
+            0.25*stab +
+            0.20*beat_strength +
+            0.15*(1.0 - np.tanh(var/10.0)) +
+            0.10*(1.0 - np.clip(multi/2.0, 0.0, 1.0)),
+            0.0, 1.0
+        ))
+
+        self._cache_tempogram[key] = val
+        return val
+
+    def _valence_tempogram(self, bpm_min=40.0, bpm_max=240.0, norm_sum=True):
+        key = f"valence_tempogram_{bpm_min}_{bpm_max}_{norm_sum}"
+        if key in self._cache_tempogram:
+            return self._cache_tempogram[key]
+
+        clarity = self._pulse_clarity(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum)["clarity"]
+        stab = self._tempo_stability_index(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum)["stability"]
+        cent = self._tempo_spectral_centroid(bpm_min=bpm_min, bpm_max=bpm_max)["centroid"]
+        bandwidth = self._tempo_bandwidth(bpm_min=bpm_min, bpm_max=bpm_max)["bandwidth"]
+        skew = self._tempo_skewness(bpm_min=bpm_min, bpm_max=bpm_max)["skewness"]
+
+        centroid_score = float(np.clip((cent - bpm_min)/(bpm_max - bpm_min), 0.0, 1.0))
+        spread_score = float(np.clip(1.0 - np.tanh(bandwidth/(0.5*(bpm_max - bpm_min) + EPS)), 0.0, 1.0))
+        skew_score = float(np.clip(0.5 + 0.25*np.tanh(skew), 0.0, 1.0))
+
+        val = float(np.clip(
+            0.30*stab + 
+            0.25*clarity + 
+            0.20*centroid_score + 
+            0.15*spread_score +
+            0.10*skew_score,
+            0.0, 1.0
+        ))
+
+        self._cache_tempogram[key] = val
+        return val
+
+    def _liveness_tempogram(self, bpm_min=40.0, bpm_max=240.0, norm_sum=True):
+        key = f"liveness_tempogram_{bpm_min}_{bpm_max}_{norm_sum}"
+        if key in self._cache_tempogram:
+            return self._cache_tempogram[key]
+        
+        curve = self._tempo_variation_curve(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum)["curve"]
+        fluc = self._beat_fluctuation_rate(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum)
+        ibi_var = 0.0
+        if "beat_times" in self._cache_tempogram:
+            ibi_var = self._interbeat_interval_variance(beat_times=self._cache_tempogram["beat_times"], normalize=True)
+
+        curve_score = float(np.clip(np.mean(curve)/50.0, 0.0, 1.0)) if curve.size > 0 else 0.0
+        fluc_score = float(np.clip(np.tanh(fluc/10.0), 0.0, 1.0))
+        ibi_score = float(np.clip(np.tanh(ibi_var), 0.0, 1.0))
+
+        val = float(np.clip(
+            0.40*curve_score +
+            0.35*fluc_score +
+            0.25*ibi_score,
+            0.0, 1.0
+        ))
+
+        self._cache_tempogram[key] = val
+        return val
+    
+    def _mode_tempogram(self, bpm_min=40.0, bpm_max=240.0, norm_sum=True):
+        key = f"mode_tempogram_{bpm_min}_{bpm_max}_{norm_sum}"
+        if key in self._cache_tempogram:
+            return self._cache_tempogram[key]
+
+        pulse = self._pulse_clarity(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum)["clarity"]
+        rep = self._beat_periodicity_strength(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum)["strength"]
+        multi = self._multi_periodic_structure(bpm_min=bpm_min, bpm_max=bpm_max, norm_score=norm_sum)["score"]
+        stab = self._tempo_stability_index(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum)["stability"]
+
+        major_score = float(np.clip(0.35*stab + 0.30*pulse + 0.20*rep + 0.15*(1.0 - np.clip(multi/2.0, 0.0, 1.0)), 0.0, 1.0))
+        minor_score = float(np.clip(0.65 - major_score, 0.0, 1.0))
+
+        mode = "major" if major_score >= minor_score else "minor"
+
+        out = {
+            "mode": mode,
+            "score_major": major_score,
+            "score_minor": minor_score,
+            "delta_score": float(major_score - minor_score)
+        }
+
+        self._cache_tempogram[key] = out
+        return out
+    
+    def _time_signature_tempogram(self, bpm_min=40.0, bpm_max=240.0, norm_sum=True):
+        key = f"time_signature_tempogram_{bpm_min}_{bpm_max}_{norm_sum}"
+        if key in self._cache_tempogram:
+            return self._cache_tempogram[key]
+
+        g = self._global_bpm(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum)
+        m = self._multi_periodic_structure(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum)
+        p = self._pulse_clarity(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum)
+        s = self._tempo_stability_index(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum)
+
+        bpm = float(g["bpm"])
+        score = float(np.clip(
+            0.35 * m["score"] +
+            0.25 * p["clarity"] +
+            0.20 * s["stability"] +
+            0.20 * (1.0 - np.clip(abs(bpm - 120.0) / 120.0, 0.0, 1.0)),
+            0.0, 1.0
+        ))
+
+        if score >= 0.60:
+            ts = 3 if m["half_bpm"] > 0 and abs(m["primary_bpm"] - 90.0) < abs(m["primary_bpm"] - 120.0) else 4
+        else:
+            ts = 4 if bpm >= 100.0 else 3
+
+        out = {
+            "time_signature": int(ts),
+            "confidence": score,
+            "primary_bpm": bpm,
+            "structure_score": m["score"]
+        }
+
+        self._cache_tempogram[key] = out
+        return out
+    
+    def spotify_audio_features(self, beat_times=None, beat_frames=None, bpm_min=40.0, bpm_max=240.0, norm_sum=True):
+        loudness_per_beat = self._loudness_per_beat(beat_times=beat_times, beat_frames=beat_frames)
+        return {
+            "loudness_per_beat": loudness_per_beat,
+            "danceability": self._danceability(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum),
+            "valence": self._valence(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum),
+            "liveness": self._liveness(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum),
+            "mode": self._mode(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum)["mode"],
+            "time_signature": self._time_signature(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum)["time_signature"],
+        }
+    
 class MFCCFeatures:
     def __init__(self, sig, n_mfcc=13, n_mels=40, n_fft=None, hop_length=None, fmin=0.0, fmax=None, dct_type=2, norm="ortho", lifter=0, htk=False, center=True, pad_mode="constant", log_mels=False, power=2.0, dtype=np.float32, compute=True):
         self.sig = sig
@@ -5686,7 +6835,8 @@ class MFCCFeatures:
             if normalize:
                 r /= (r[0] + EPS)
 
-            acf[k] = r
+            center = len(r)//2
+            acf[k] = r[center:center + max_lag + 1]
 
         lags = np.arange(max_lag + 1, dtype=int)
         result = {
@@ -5819,7 +6969,7 @@ class MFCCFeatures:
 
         segment = X[:, :attack_frames]
         diff = np.diff(segment, axis=1)
-        step_energy = np.linalg.norm(diffs, axis=0)
+        step_energy = np.linalg.norm(diff, axis=0)
 
         if step_energy.size == 0:
             result = 1.0
@@ -5968,7 +7118,7 @@ class MFCCFeatures:
         if reference is None:
             score = float(np.linalg.norm(pattern))
         else:
-            reference = np.asrray(reference, dtype=float).reshape(-1)
+            reference = np.asarray(reference, dtype=float).reshape(-1)
             m = min(reference.size, pattern.size)
             if m == 0:
                 score = 0.0
@@ -5992,17 +7142,545 @@ class MFCCFeatures:
             self._cache_mfcc[key] = 0.0
             return result
         
-        d1 = librosa.feature.delta(X, width=width, order=1, axis=1, mode=mode)
-        d2 = librosa.feature.delta(X, width=width, order=2, axis=1, mode=mode)
+        d1 = librosa.feature.delta(self.mfcc, width=width, order=1, axis=1, mode=mode)
+        d2 = librosa.feature.delta(self.mfcc, width=width, order=2, axis=1, mode=mode)
 
         rough1 = np.mean(np.linalg.norm(d1, axis=0))
         rough2 = np.mean(np.linalg.norm(d2, axis=0))
 
         if normalize:
-            scale = np.mean(np.linalg.norm(X, axis=0)) + EPS
+            scale = np.mean(np.linalg.norm(self.mfcc, axis=0)) + EPS
             roughness = (rough1 + 0.5*rough2)/scale
         else:
             roughness = rough1 + 0.5*rough2
 
         self._cache_mfcc[key] = float(roughness)
         return roughness
+    
+    # Spotify-based MFCC Features
+    def _mfcc_frame_energy(self, normalize=True):
+        key = f"mfcc_frame_energy_normalize_{normalize}"
+        if key in self._cache_mfcc:
+            return self._cache_mfcc[key]
+
+        if self.mfcc is None or self.mfcc.size == 0:
+            result = np.array([], dtype=float)
+            self._cache_mfcc[key] = result
+            return result
+        
+        E = np.sum(self.mfcc**2, axis=0).astype(float)
+        if normalize:
+            E /= (np.max(E) + EPS)
+
+        self._cache_mfcc[key] = E
+        return E
+
+    def _mfcc_energy(self, normalize=True):
+        key = f"mfcc_energy_normalize_{normalize}"
+        if key in self._cache_mfcc:
+            return self._cache_mfcc[key]
+
+        E = self._mfcc_frame_energy(normalize=normalize)
+        if E.size == 0:
+            result = 0.0
+        else:
+            result = float(np.mean(E))
+
+        self._cache_mfcc[key] = result
+        return result
+
+    def _mfcc_rms_energy(self, normalize=True):
+        key = f"mfcc_rms_energy_normalize_{normalize}"
+        if key in self._cache_mfcc:
+            return self._cache_mfcc[key]
+
+        if self.mfcc is None or self.mfcc.size == 0:
+            result = 0.0
+            self._cache_mfcc[key] = result
+            return result
+
+        if normalize:
+            x = self.mfcc/(np.max(np.abs(self.mfcc)) + EPS)
+        else:
+            x = self.mfcc
+
+        result = float(np.sqrt(np.mean(x**2)))
+
+        self._cache_mfcc[key] = result
+        return result
+
+    def _mfcc_flux(self, normalize=True):
+        key = f"mfcc_flux_normalize_{normalize}"
+        if key in self._cache_mfcc:
+            return self._cache_mfcc[key]
+
+        if self.mfcc is None or self.mfcc.size == 0 or self.mfcc.shape[1] < 2:
+            result = 0.0
+            self._cache_mfcc[key] = 0.0
+            return 0.0
+
+        d = np.diff(self.mfcc, axis=1)
+        flux = np.mean(np.linalg.norm(d, axis=0))
+
+        if normalize:
+            scale = np.mean(np.linalg.norm(self.mfcc, axis=0)) + EPS
+            flux /= scale
+
+        result = float(flux)
+
+        self._cache_mfcc[key] = result
+        return result
+
+    def _mfcc_high_order_variance(self, start_coeff=6, normalize=True):
+        key = f"mfcc_high_order_variance_start_{start_coeff}_normalize_{normalize}"
+        if key in self._cache_mfcc:
+            return self._cache_mfcc[key]
+        
+        if self.mfcc is None or self.mfcc.size == 0:
+            result = 0.0
+            self._cache_mfcc[key] = result
+            return result
+        
+        X = self.mfcc[start_coeff:, :]
+        if X.size == 0:
+            result = 0.0
+            self._cache_mfcc[key] = result
+            return result
+
+        v = float(np.mean(np.var(X, axis=1)))
+        if normalize:
+            v /= (np.mean(np.var(self.mfcc, axis=1)) + EPS)
+
+        self._cache_mfcc[key] = v
+        return v
+
+    def _mfcc_entropy(self, normalize=True):
+        key = f"mfcc_entropy_normalize_{normalize}"
+        if key in self._cache_mfcc:
+            return self._cache_mfcc[key]
+
+        if self.mfcc is None or self.mfcc.size == 0:
+            result = 0.0
+            self._cache_mfcc[key] = result
+            return result
+        
+        X = np.abs(self.mfcc)
+        col = np.mean(X, axis=1)
+        p = col/(np.sum(col) + EPS)
+        ent = -np.sum(p*np.log(p + EPS))
+
+        if normalize:
+            ent /= np.log(len(p) + EPS)
+
+        self._cache_mfcc[key] = float(ent)
+        return float(ent)
+
+    def _mfcc_smoothness(self, weight_delta=1.0, weight_ddelta=0.5, normalize=True):
+        key = f"mfcc_smoothness_proxy_{weight_delta}_{weight_ddelta}_{normalize}"
+        if key in self._cache_mfcc:
+            return self._cache_mfcc[key]
+
+        if self.mfcc is None or self.mfcc.size == 0:
+            result = 0.0
+            self._cache_mfcc[key] = result
+            return result
+
+        d1 = self._mfcc_delta()
+        d2 = self._mfcc_delta2()
+
+        e1 = float(np.mean(np.linalg.norm(d1, axis=0))) if d1.size > 0 else 0.0
+        e2 = float(np.mean(np.linalg.norm(d2, axis=0))) if d2.size > 0 else 0.0
+        rough = weight_delta*e1 + weight_ddelta*e2
+
+        if normalize:
+            scale = float(np.mean(np.linalg.norm(self.mfcc, axis=0)) + EPS)
+            smooth = 1.0/(1.0 + rough/scale)
+        else:
+            smooth = 1.0/(1.0 + rough)
+
+        smooth = float(safe_clip01(smooth))
+        
+        self._cache_mfcc[key] = smooth
+        return smooth
+    
+    def _loudness_mfcc(self):
+        key = "loudness_mfcc"
+        if key in self._cache_mfcc:
+            return self._cache_mfcc[key]
+
+        loud = self._mfcc_energy(normalize=True)
+
+        self._cache_mfcc[key] = loud
+        return loud
+
+    def _energy_mfcc(self):
+        key = "energy_mfcc"
+        if key in self._cache_mfcc:
+            return self._cache_mfcc[key]
+        
+        e0 = self._mfcc_spectral_slope_proxy(coeff=0, aggregate="rms")
+        e1 = self._mfcc_rms_energy(normalize=True)
+        e2 = self._mfcc_energy(normalize=True)
+
+        val = float(np.clip(0.4*abs(e0) + 0.3*e1 + 0.3*e2, 0.0, 1.0))
+
+        self._cache_mfcc[key] = val
+        return val
+    
+    def _speechiness_mfcc(self):
+        key = "speechiness_mfcc"
+        if key in self._cache_mfcc:
+            return self._cache_mfcc[key]
+        
+        flux = self._mfcc_flux(normalize=True)
+        high = self._mfcc_high_order_energy(start_coeff=6, normalize=True, order="l2")
+        var = self._mfcc_high_order_variance(start_coeff=6, normalize=True)
+        ent = self._mfcc_entropy(normalize=True)
+
+        val = float(np.clip(
+            0.40*flux + 
+            0.30*np.clip(high, 0.0, 1.0) +
+            0.20*np.clip(var, 0.0, 1.0) +
+            0.10*ent,
+            0.0, 1.0
+        ))
+
+        self._cache_mfcc[key] = val
+        return val
+    
+    def _acousticness_mfcc(self):
+        key = "acousticness_mfcc"
+        if key in self._cache_mfcc:
+            return self._cache_mfcc[key]
+
+        smooth = self._mfcc_smoothness(normalize=True)
+        ent = self._mfcc_entropy(normalize=True)
+        high = self._mfcc_high_order_energy(start_coeff=6, normalize=True, order="l2")
+        flux = self._mfcc_flux(normalize=True)
+
+        val = float(np.clip(
+            0.35*smooth +
+            0.25*(1.0 - ent) +
+            0.25*(1.0 - np.clip(high, 0.0, 1.0)) + 
+            0.15*(1.0 - np.clip(flux, 0.0, 1.0)),
+            0.0, 1.0
+        ))
+
+        self._cache_mfcc[key] = val
+        return val
+
+    def _valence_mfcc(self):
+        key = "valence_mfcc"
+        if key in self._cache_mfcc:
+            return self._cache_mfcc[key]
+        
+        bright = self._mfcc_brightness_proxy(coeff=0, invert=False, aggregate="mean")
+        smooth = self._mfcc_smoothness(normalize=True)
+        rough = self._mfcc_transient_roughness(width=9, normalize=True, mode="interp")
+        ent = self._mfcc_entropy(normalize=True)
+
+        b = float(np.tanh(np.abs(bright)))
+        r = float(np.clip(rough/(1.0 + rough), 0.0, 1.0))
+
+        val = float(np.clip(
+            0.35*b +
+            0.30*smooth +
+            0.20*(1.0 - r) +
+            0.15*(1.0 - ent),
+            0.0, 1.0
+        ))
+
+        self._cache_mfcc[key] = val
+        return val
+
+    def _liveness_mfcc(self):
+        key = "liveness_mfcc"
+        if key in self._cache_mfcc:
+            return self._cache_mfcc[key]
+
+        rough = self._mfcc_transient_roughness(width=9, normalize=True, mode="interp")
+        flux = self._mfcc_flux(normalize=True)
+        high = self._mfcc_high_order_energy(start_coeff=6, normalize=True, order="l2")
+        ent = self._mfcc_entropy(normalize=True)
+
+        val = float(np.clip(
+            0.35*np.clip(rough/(1.0 + rough), 0.0, 1.0) +
+            0.30*np.clip(flux, 0.0, 1.0) +
+            0.20*np.clip(high, 0.0, 1.0) +
+            0.15*ent,
+            0.0, 1.0
+        ))
+
+        self._cache_mfcc[key] = val
+        return val
+
+    def _instrumentalness_mfcc(self):
+        key = "instrumentalness_mfcc"
+        if key in self._cache_mfcc:
+            return self._cache_mfcc[key]
+
+        speech = self._speechiness_mfcc()
+        smooth = self._mfcc_smoothness(normalize=True)
+        high = self._mfcc_high_order_energy(start_coeff=6, normalize=True, order="l2")
+
+        val = float(np.clip(
+            0.55*(1.0 - speech) +
+            0.25*smooth +
+            0.20*(1.0 - np.clip(high, 0.0, 1.0)),
+            0.0, 1.0
+        ))
+
+        self._cache_mfcc[key] = val
+        return val
+
+    def spotify_audio_features(self):
+        return {
+            "loudness": self._loudness_mfcc(),
+            "energy": self._energy_mfcc(),
+            "speechiness": self._speechiness_mfcc(),
+            "acousticness": self._acousticness_mfcc(),
+            "valence": self._valence_mfcc(),
+            "liveness": self._liveness_mfcc(),
+            "instrumentalness": self._instrumentalness_mfcc(),
+        }
+
+class SpotifyFeatureProxies:
+    """
+    Proxies for Spotify-style features using:
+        - time_features: time-domain stats (RMS, envelope, etc.)
+        - freq_features: spectral stats (centroid, flatness, etc.)
+        - mfcc_features: MFCCFeatures instance (statistical, temporal, shape, noise proxies)
+        - chroma_features: ChromaFeatures isntance (key, mode, tonality)
+        - tempo_features: TempogramFeatures instance (global/local tempo, pulse clarity, etc.)
+    """
+
+    def __init__(self, 
+                 time_features=None,
+                 freq_features=None,
+                 mfcc_features=None,
+                 chroma_features=None,
+                 tempo_features=None):
+        self.time_features = time_features
+        self.freq_features = freq_features
+        self.mfcc_features = mfcc_features
+        self.chroma_features = chroma_features
+        self.tempo_features = tempo_features
+
+    # Loudness Features
+    def loudness_time(self) -> float:
+        if self.time_features is None:
+            return 0.0
+        
+        return float(self.time_features._loudness_time_active_db())
+    
+    def loudness_freq(self) -> float:
+        if self.freq_features is None:
+            return 0.0
+        
+        return float(self.freq_features._loudness_freq_db())
+    
+
+    def loudness_mfcc(self) -> float:
+        if self.mfcc_features is None:
+            return 0.0
+        
+        return float(self.mfcc_features._loudness_mfcc_mean())
+    
+    def loudness_tempogram(self) -> float:
+        if self.tempo_features is None or self.time_features is None:
+            return 0.0
+        
+        return float(self.tempo_features._loudness_tempogram_per_beat(self.time_features))
+    
+    def loudness_fused(self) -> dict:
+        """
+        Fuse domain-based loudness estimates into one score.
+        Returns both per-domain values and a fused estimate.
+
+        Strategy:
+          - work in a pseudo-dB space for time and frequency,
+          - rescale MFCC/tempo proxies to roughly comparable ranges,
+          - combine via weighted average.
+        """
+        L_time = self.loudness_time()       # dB
+        L_freq = self.loudness_freq()       # dB
+        L_mfcc = self.loudness_mfcc()       # arbitrary units
+        L_temp = self.loudness_tempogram()  # RMS
+
+        # Normalize partial proxies roughly into dB-like scale
+        L_mfcc_db = 10.0*np.log10(abs(L_mfcc) + 1.0)
+        L_temp_db = 20.0*np.log10(L_temp + EPS) if L_temp > 0.0 else -80.0
+
+        # Weights: time + frequency stronger, MFCC + tempogram weaker
+        vals = np.array([L_time, L_freq, L_mfcc_db, L_temp_db], dtype=float)
+        weights = np.array([0.4, 0.4, 0.1, 0.1], dtype=float)
+
+        # handle missing domains (zeros with weight zero)
+        mask = ~np.isinf(vals) and ~np.isnan(vals)
+        if not np.any(mask):
+            fused = -80.0
+        else:
+            w = weights[mask]
+            v = vals[mask]
+            fused = float(np.sum(w*v)/(np.sum(w) + EPS))
+
+        return {
+            "loudness_time_db": float(L_time),
+            "loudness_freq_db": float(L_freq),
+            "loudness_mfcc_proxy": float(L_mfcc),
+            "loudness_tempogram_proxy": float(L_temp),
+            "loudness_fused_db": fused
+        }
+    
+    # Energy Features
+    def energy_time(self, normalize=True):
+        """
+        Full-support time-domain energy:
+        mean short-time energy or RMS-derived energy.
+        """
+        if self.time_features is None:
+            return 0.0
+        
+        key = f"energy_time_{normalize}"
+        if key in self.time_features._cache_time:
+            return self.time_features._cache_time[key]
+        
+        if hasattr(self.time_features, "_short_time_energy"):
+            ste = self.time_features._short_time_energy()
+            val = float(np.mean(ste)) if normalize else float(np.sum(ste))
+        elif hasattr(self.time_features, "_rms_envelope"):
+            rms = self.time_features._rms_envelope()
+            val = float(np.mean(rms**2)) if normalize else float(np.sum(rms**2))
+        else:
+            val = float(np.mean(self.time_features.y**2))
+
+        self.time_features._cache_time[key] = val
+        return val
+    
+    def energy_frequency(self, weighted=False):
+        """
+        Full-support frequency-domain energy:
+        mean power over the spectrogram, optionally perceptually weighted.
+        """
+        if self.freq_features is None:
+            return 0.0
+        
+        key = f"energy_frequency_{weighted}"
+        if hasattr(self.freq_features, "_cache_freq") and key in self.freq_features._cache_freq:
+            return self.freq_features._cache_freq[key]
+        
+        if hasattr(self.freq_features, "_spectrogram_power"):
+            S = self.freq_features._spectrogram_power()
+        elif hasattr(self.freq_features, "S_pow") and self.freq_features.S_pow is not None:
+            S = self.freq_features.S_pow
+        elif hasattr(self.freq_features, "S_mag") and self.freq_features.S_mag is not None:
+            S = self.freq_features.S_mag**2
+        else:
+            y = getattr(self.freq_features, "y", None)
+            sr = getattr(self.freq_features, "sr", None)
+            N = getattr(self.freq_features, "N", 2048)
+            H = getattr(self.freq_features, 512)
+
+            if y is None or sr is None:
+                return 0.0
+
+            S = np.abs(librosa.stft(y, n_fft=N, hop_length=H))**2
+
+        if S.size == 0:
+            val = 0.0
+        elif weighted and hasattr(self.freq_features, "_fft_freqs"):
+            f = np.asarray(self.freq_features._fft_freqs, dtype=float)
+            w = 1.0 + 0.5*(f/(f.max() + EPS))
+            val = float(np.mean(np.sum(S*w[:, None], axis=0)))
+        else:
+            val = float(np.mean(np.sum(S, axis=0)))
+
+        if not hasattr(self.freq_features, "_cache_freq"):
+            self.freq_features._cache_freq = {}
+        
+        self.freq_features._cache_freq[key] = val
+        return val
+    
+    def energy_mfcc(self, start_coeff=0, normalize=True):
+        """
+        Partial MFCC energy proxy:
+        low-order MFCC energy or c0-based energy if available.
+        """
+        if self.mfcc_features is None or getattr(self.mfcc_features, "mfcc", None) is None:
+            return 0.0
+
+        key = f"energy_mfcc_{start_coeff}_{normalize}"
+        if key in self.mfcc._cache_mfcc:
+            return self.mfcc_features._cache_mfcc[key]
+        
+        M = self.mfcc_features.mfcc
+        if M.size == 0 or start_coeff >= M.shape[0]:
+            val = 0.0
+        else:
+            X = M[start_coeff:, :]
+            val = float(np.mean(np.sum(X**2, axis=0))) if normalize else float(np.sum(X**2))
+        
+
+        self.mfcc_features._cache_mfcc[key] = val
+        return val
+    
+    def energy_chroma(self, normalize=True):
+        """
+        Weak partial chroma energy proxy:
+        chroma vector norm or average pitch-class concentration.
+        """
+        if self.chroma_features is None:
+            return 0.0
+        
+        key = f"energy_chroma_{normalize}"
+        if hasattr(self.chroma_features, "_cache_chroma") and key in self.chroma_features._cache_chroma:
+            return self.chroma_features._cache_chroma[key]
+
+        if hasattr(self.chroma_features, "_chroma_vector"):
+            C = self.chroma_features._chroma_vector()
+        elif hasattr(self.chroma_features, "chroma"):
+            C = self.chroma_features.chroma
+        else:
+            return 0.0
+        
+        if C is None or C.size == 0: 
+            val = 0.0
+        else:
+            val = float(np.mean(np.sum(C**2, axis=0))) if normalize else float(np.sum(C**2))
+
+        if not hasattr(self.chroma, "_cache_chroma"):
+            self.chroma_features._cache_chroma = {}
+        
+        self.chroma_features._cache_chroma[key] = val
+        return val
+
+    def energy_fused(self, weights=None):
+        """
+        Fuse all domain energy proxies into a single scalar.
+        Time and Frequency are primary; MFCC and chroma are secondary.
+        """
+        Et = self.energy_time(normalize=True)
+        Ef = self.energy_frequency(weighted=True)
+        Em = self.energy_mfcc(start_coeff=0, normalize=True)
+        Ec = self.energy_chroma(normalize=True)
+
+        vals = np.array([Et, Ef, Em, Ec], dtype=float)
+
+        if weights is None:
+            weights = np.array([0.4, 0.4, 0.15, 0.05], dtype=float)
+        else:
+            weights = np.asarray(weights, dtype=float)
+
+        mask = np.isfinite(vals)
+        if not np.any(mask):
+            fused = 0.0
+        else:
+            fused = float(np.sum(weights[mask]*vals[mask])/(np.sum(weights[mask]) + EPS))
+
+        return {
+            "energy_time": float(Et),
+            "energy_frequency": float(Ef),
+            "energy_mfcc": float(Em),
+            "energy_chroma": float(Ec),
+            "energy_fused": fused,
+        }
