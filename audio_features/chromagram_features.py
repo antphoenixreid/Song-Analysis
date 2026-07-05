@@ -100,13 +100,15 @@ class ChromagramFeatures():
         return C/S
     
     def _chroma_profile(self, normalize=True, use_db=False):
-        C = self._chroma_db() if use_db else self._chroma()
+        C = self._chroma()                          # always start linear
         if normalize:
             colsum = np.sum(C, axis=0, keepdims=True)
             zero_cols = colsum <= EPS
             C = C / (colsum + EPS)
             if np.any(zero_cols):
                 C[:, zero_cols[0]] = 1.0 / 12.0
+        if use_db:
+            C = 10.0 * np.log10(C + EPS)           # convert after normalization
         return C
 
     def _mean_chroma(self, normalize=True, use_db=False):
@@ -255,13 +257,13 @@ class ChromagramFeatures():
         centroid_idx = (12.0*mu/(2.0*np.pi))%12.0
 
         idx = np.arange(12)[:, None]
-        dist = np.minimum(np.abs(idx - centroid_idx[None, :]), 12 - np.abs(idx - centroid_idx[None, :]))
+        abs_dist = np.minimum(np.abs(idx - centroid_idx[None, :]), 12 - np.abs(idx - centroid_idx[None, :]))
+        signed_dist = (idx - centroid_idx[None, :] + 6) % 12 - 6  # wraps to [-6, 6)
 
-        m2 = np.sum((dist**2)*P, axis=0)
-        m3 = np.sum((dist**3)*P, axis=0)
+        m2 = np.sum((abs_dist**2)*P, axis=0)
+        m3 = np.sum((signed_dist**3)*P, axis=0)   # signed — allows negative skew
 
         skew = m3/(np.power(m2, 1.5) + EPS)
-
         
         self._cache_chroma[key] = skew
         return skew
@@ -386,7 +388,7 @@ class ChromagramFeatures():
         p = p/(np.sum(p) + EPS)
 
         H = -np.sum(p*np.log(p + EPS))
-        H_norm = H/np.log(len(scores) + EPS)
+        H_norm = H / np.log(len(scores))
 
         result = {
             "harmonic_entropy": H_norm,
@@ -478,9 +480,10 @@ class ChromagramFeatures():
         det = self._chord_detection(normalize=normalize, use_db=use_db, method=method)
         chord_labels = det["chord_labels"]
 
-        if len(chord_labels) == 0:
+        if len(chord_labels) <= 1:
+            label_list = list(chord_labels) if len(chord_labels) == 1 else []
             result = {
-                "labels": [],
+                "labels": label_list,
                 "transition_counts": np.zeros((0, 0), dtype=float),
                 "transition_probs": np.zeros((0, 0), dtype=float)
             }
@@ -593,7 +596,7 @@ class ChromagramFeatures():
         """
         Tonal stability index with proper scaling
         """
-        key = f"tonal_stability_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}_{method}"
+        key = f"tonal_stability_index_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}_{method}"
         if key in self._cache_chroma:
             return self._cache_chroma[key]
         
@@ -1060,12 +1063,12 @@ class ChromagramFeatures():
         major = self._mode_classification(normalize=normalize, use_db=use_db, method="cosine")["mode"] == "maj"
         key_res = self._key_estimation(normalize=normalize, use_db=use_db, method="cosine")
         tonic = key_res["tonic"]
-        templates = self._chroma_template()["templates"]
+        templates = self._chroma_template()
         maj_score = float(key_res["scores"][tonic])
         min_score = float(key_res["scores"][tonic + 12])
         clarity = self._tonal_clarity(normalize=normalize, use_db=use_db, method="cosine")["tonal_clarity"]
         fit = self._harmonic_template_fit(normalize=normalize, use_db=use_db, method="cosine")["best_score"]
-        bright = float((prof[(tonic + 4)%12] + prof[(tonic + 7)%12] + prof[(tonic + 11)%12])/(np.sum(prof) + EPS))
+        bright = float((prof[tonic % 12] + prof[(tonic + 4)%12] + prof[(tonic + 7)%12] + prof[(tonic + 11)%12]) / (np.sum(prof) + EPS))
         delta = maj_score - min_score
 
         val = safe_clip01(0.40*(0.5 + 0.5*np.tanh(delta)) + 0.25*clarity + 0.20*fit + 0.15*bright)

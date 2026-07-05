@@ -10,7 +10,9 @@ from .time_features import TimeFeatures
 from .frequency_features import FrequencyFeatures
 from .chromagram_features import ChromagramFeatures
 from .tempogram_features import TempogramFeatures
+from .feature_extractor import FeatureExtractor
 from .mfcc_features import MFCCFeatures
+from .spotify_features import SpotifyFusion
 
 __all__ = [
     'AudioSignal',
@@ -19,6 +21,8 @@ __all__ = [
     'ChromagramFeatures',
     'TempogramFeatures',
     'MFCCFeatures',
+    'FeatureExtractor',
+    'SpotifyFusion',
     # Utility functions
     'EPS',
     'safe_median',

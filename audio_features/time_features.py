@@ -406,15 +406,8 @@ class TimeFeatures():
             return self._cache_time[key]
         
         y_padded = np.pad(self.y, int(self.N // 2), mode="reflect")
-        frames = librosa.util.frame(y_padded, frame_length=self.N, hop_length=self.H)
-
-        zcr = np.zeros(frames.shape[1], dtype=float)
-        for i in range(frames.shape[1]):
-            frame = frames[:, i]
-            signs = np.sign(frame)
-            signs[signs == 0] = 1
-            crossings = np.sum(np.abs(np.diff(signs))) / 2.0
-            zcr[i] = float(crossings / len(frame))
+        zcr_frames = librosa.feature.zero_crossing_rate(y_padded, frame_length=self.N, hop_length=self.H, center=False)
+        zcr = np.ravel(zcr_frames).astype(float)
 
         self._cache_time[key] = zcr
         return zcr
@@ -448,32 +441,37 @@ class TimeFeatures():
         zcr = self._zero_crossing_rate()
         mask = self._active_rms_mask(db_threshold=db_threshold)
 
-        if mask.sum() < 2:
+        n = min(len(zcr), len(mask))
+        if n < 2 or mask.sum() < 2:
             self._cache_time[key] = 0.0
             return 0.0
         
-        n = min(len(zcr), len(mask))
         zcr = zcr[:n]
         mask = mask[:n]
-        
-        num_frames = len(zcr)
+
+        num_frames = n
         ac_peaks = np.zeros(num_frames, dtype=float)
 
         f_min = 50.0
         f_max = 400.0
 
         # Convert to lag range
-        min_lag = int(self.sr / f_max)  # smallest lag (highest pitch)
-        max_lag = int(self.sr / f_min)  # largest lag (lowest pitch)
+        min_lag = int(self.sr/f_max) # smallest lag (highest pitch)
+        max_lag = int(self.sr/f_min) # largest lag (lowest pitch)
         min_lag = max(min_lag, 2)
 
-        for i in range(num_frames):
+        # Use framed signal for efficiency (pad to match other routines)
+        y_padded = np.pad(self.y, int(self.N//2), mode='reflect')
+        frames = librosa.util.frame(y_padded, frame_length=self.N, hop_length=self.H)
+
+        # frames shape (N, num_frames_available)
+        num_avail = min(frames.shape[1], num_frames)
+
+        for i in range(num_avail):
             if not mask[i]:
                 continue
 
-            start = i*self.H
-            end = start + self.N
-            frame = self.y[start:end]
+            frame = frames[:, i]
 
             if frame.size < 3:
                 continue
@@ -485,8 +483,6 @@ class TimeFeatures():
             if ac[0] <= EPS:
                 ac_peaks[i] = 0.0
                 continue
-
-            ac /= ac[0]
 
             cur_max_lag = min(max_lag, len(ac) - 1)
 
@@ -503,8 +499,8 @@ class TimeFeatures():
 
         voiced = strong_periodic | (moderate_periodic & low_zcr)
 
-        voiced_frames = voiced.sum()
-        active_frames = mask.sum()
+        voiced_frames = int(np.sum(voiced[:n]))
+        active_frames = int(np.sum(mask[:n]))
 
         ratio = float(voiced_frames)/float(active_frames + EPS)
 
@@ -660,10 +656,9 @@ class TimeFeatures():
         ac = ac[center:center + max_lag + 1]
 
         # Normalize
-        if normalize and ac[0] > 0:
-            ac /= ac[0]
-        else:
-            ac = np.ones(1, dtype=float)
+        ac = ac.astype(float)
+        if normalize and ac.size > 0 and ac[0] > 0:
+            ac = ac/ac[0]
 
         self._cache_time[key] = ac.astype(float)
         return ac.astype(float)
@@ -1130,13 +1125,10 @@ class TimeFeatures():
             self.cache_time["frames"] = np.empty((0, self.N), dtype=float)
             return self._cache_time["frames"]
         
-        num_frames = 1 + (L - self.N)//self.H
-        frames = np.zeros((num_frames, self.N), dtype=float)
-
-        for i in range(num_frames):
-            start = i*self.H
-            end = start + self.N
-            frames[i, :] = self.y[start:end]
+        # Use librosa.util.frame for efficient framing (returns shape (frame_length, num_frames))
+        y_padded = np.pad(self.y, int(self.N//2), mode='reflect')
+        framed = librosa.util.frame(y_padded, frame_length=self.N, hop_length=self.H)
+        frames = framed.T.astype(float) # shape (num_frames, N)
 
         self._cache_time["frames"] = frames
         return frames
@@ -1748,6 +1740,59 @@ class TimeFeatures():
 
         self._cache_time[key] = val
         return val
+    
+    def _spotify_instrumentalness(self) -> float:
+        key = "spotify_instrumentalness"
+        if key in self._cache_time:
+            return self._cache_time[key]
+        
+        if getattr(self, "invalid", False):
+            self._cache_time[key] = 0.0
+            return 0.0
+        
+        rms = self._rms_envelope()
+        if rms.size < 2:
+            self._cache_time[key] = 0.0
+            return 0.0
+        
+        silence = self._silence_ratio(db_threshold=-60.0)
+        voiced = self._voiced_ratio(db_threshold=-60.0)
+        unvoiced = self._unvoiced_ratio()
+
+        attack_time = self._attack_time()
+        attack_slope = self._attack_slope()
+        decay_slope = self._decay_slope()
+        transient_rate = self._transient_rate()
+        zcr_var = self._zcr_variance()
+
+        diffs = np.abs(np.diff(rms))
+        smoothness = 1.0 - (np.mean(diffs)/(np.mean(rms) + EPS))
+        smoothness = safe_clip01(smoothness)
+
+        silence_score = safe_clip01(silence)
+        nonvocal_score = safe_clip01(unvoiced)
+
+        attack_time_score = safe_clip01(attack_time/(attack_time + 0.05))
+        attack_slope_score = safe_clip01(1.0/(1.0 + abs(attack_slope)/50.0))
+        decay_slope_score = safe_clip01(1.0/(1.0 + abs(decay_slope)/50.0))
+
+        transient_score = safe_clip01(1.0 - transient_rate/(transient_rate + 3.0))
+        zcr_score = safe_clip01(1.0 - zcr_var/(1.0 + zcr_var))
+
+        w_nv = 0.22
+        w_sm = 0.20
+        w_ss = 0.16
+        w_ats = 0.14
+        w_ass = 0.10
+        w_dss = 0.08
+        w_ts = 0.05
+        w_zcr = 0.05
+
+        val = (w_nv*nonvocal_score + w_sm*smoothness + w_ss*silence_score + w_ats*attack_time_score + + w_ass*attack_slope_score + w_dss*decay_slope_score + w_ts*transient_score + w_zcr*zcr_score)
+
+        val = safe_clip01(val)
+        self._cache_time[key] = val
+        return val
 
     def _spotify_time_signature(self) -> int:
         key = "spotify_time_signature"
@@ -1795,11 +1840,13 @@ class TimeFeatures():
         danceability = self._spotify_danceability()
         tempo = self._spotify_tempo()
         liveness = self._spotify_liveness()
+        instrumentalness = self._spotify_instrumentalness()
         time_signature = self._spotify_time_signature()
 
-        loudness_score = safe_clip01((loudness + 60.0)/60.0)
-        energy_score = safe_clip01(energy/(energy + 0.01))
-        tempo_score = safe_clip01(tempo/200.0)
+        loudness_score = safe_clip01((loudness + 60.0) / 60.0)
+        energy_score = safe_clip01(energy / (energy + 0.01))
+        tempo_score = safe_clip01(tempo / 200.0)
+        time_signature_score = 1.0 if time_signature == 4 else 0.5 if time_signature == 3 else 0.0
 
         vals = np.array([
             loudness_score,
@@ -1809,13 +1856,28 @@ class TimeFeatures():
             danceability,
             tempo_score,
             liveness,
-            1.0 if time_signature == 4 else 0.5 if time_signature == 3 else 0.0
+            instrumentalness,
+            time_signature_score,
         ], dtype=float)
 
         if weights is None:
-            weights = np.array([0.15, 0.15, 0.12, 0.12, 0.18, 0.14, 0.08, 0.06], dtype=float)
+            weights = np.array([
+                0.14,
+                0.14,
+                0.11,
+                0.11,
+                0.16,
+                0.13,
+                0.08,
+                0.09,
+                0.04,
+            ], dtype=float)
 
-        fused = float(np.sum(vals*weights)/(np.sum(weights) + EPS))
+        weights = np.asarray(weights, dtype=float)
+        if weights.size != vals.size:
+            raise ValueError(f"weights must have length {vals.size}, got {weights.size}")
+
+        fused = float(np.sum(vals * weights) / (np.sum(weights) + EPS))
 
         return {
             "loudness_db": loudness,
@@ -1825,6 +1887,7 @@ class TimeFeatures():
             "danceability": danceability,
             "tempo_bpm": tempo,
             "liveness": liveness,
+            "instrumentalness": instrumentalness,
             "time_signature": time_signature,
-            "spotify_fused": safe_clip01(fused)
+            "spotify_fused": safe_clip01(fused),
         }

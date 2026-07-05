@@ -62,10 +62,10 @@ class MFCCFeatures:
             dtype=self.dtype
         )
 
+        self.S_db = librosa.power_to_db(self.S, ref=np.max)
         if self.log_mels:
             S_in = np.log(self.S + EPS)
         else:
-            self.S_db = librosa.power_to_db(self.S, ref=np.max)
             S_in = self.S_db
 
         self.mfcc = librosa.feature.mfcc(
@@ -109,7 +109,7 @@ class MFCCFeatures:
         self._cache_mfcc[key] = mean
         return mean
     
-    def _mfcc_variance(self, ddof=1):
+    def _mfcc_variance(self, ddof=0):
         key = f"mfcc_variance_ddof_{ddof}"
         if key in self._cache_mfcc:
             return self._cache_mfcc[key]
@@ -243,7 +243,7 @@ class MFCCFeatures:
             x = self.mfcc[k] - np.mean(self.mfcc[k])
             r = np.correlate(x, x, mode='full')
             if normalize:
-                r /= (r[0] + EPS)
+                r /= (r[len(r)//2] + EPS)
 
             center = len(r)//2
             acf[k] = r[center:center + max_lag + 1]
@@ -343,7 +343,12 @@ class MFCCFeatures:
             raise ValueError("Invalid order: must be 'l2', 'l1', or 'rms'")
         
         if normalize:
-            denom = float(np.sum(self.mfcc**2) + EPS) if order == 'l2' else float(np.sum(np.abs(self.mfcc)) + EPS)
+            if order == 'l2':
+                denom = float(np.sum(self.mfcc**2) + EPS)
+            elif order == 'l1':
+                denom = float(np.sum(np.abs(self.mfcc)) + EPS)
+            else:
+                denom = float(np.sqrt(np.mean(self.mfcc**2)) + EPS)
             energy /= denom
 
         self._cache_mfcc[key] = energy
@@ -388,7 +393,7 @@ class MFCCFeatures:
         
         if normalize:
             denom = np.max(np.linalg.norm(segment, axis=0)) + EPS
-            smoothness = 1.0 - (np.mean(step_energy)/denom)
+            smoothness = 1.0 / (1.0 + np.mean(step_energy) / denom)
         else:
             smoothness = 1.0/(1.0 + np.mean(step_energy))
 
@@ -430,7 +435,8 @@ class MFCCFeatures:
         sigma = np.std(sustain, axis=1, ddof=ddof)
 
         if normalize:
-            stability = 1.0 - np.mean(sigma/(np.abs(mu) + EPS))
+            cv = np.mean(sigma/(np.abs(mu) + EPS))
+            stability = 1.0/(1.0 + cv)
         else:
             stability = 1.0/(1.0 + np.mean(sigma))
 
@@ -680,7 +686,7 @@ class MFCCFeatures:
         ent = -np.sum(p*np.log(p + EPS))
 
         if normalize:
-            ent /= np.log(len(p) + EPS)
+            ent /= np.log(len(p))
 
         self._cache_mfcc[key] = float(ent)
         return float(ent)

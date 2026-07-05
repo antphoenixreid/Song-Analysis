@@ -64,7 +64,7 @@ class FrequencyFeatures():
         If power=False: 20*log10(|X|)
         if power=True: 10*log10(|X|^2)
         """
-        key = f"db_{'pow' if power else 'map'}"
+        key = f"db_{'pow' if power else 'mag'}"
         if key in self._cache_freq:
             return self._cache_freq[key]
 
@@ -194,8 +194,19 @@ class FrequencyFeatures():
     
     def _spectral_rolloff(self, roll_percent=0.85, use_power=True):
         """
-        Spectral rolloff per frame (Hz)
-        roll_percent in (0, 1), e.g. 0.85 or 0.95
+        Spectral rolloff per frame (Hz), the frequency below which roll_percent of power resides.
+        
+        Parameters
+        ----------
+        roll_percent : float, default 0.85
+            Percentile threshold (0, 1), e.g. 0.85 means freq where 85% of energy is below
+        use_power : bool, default True
+            Use power spectrum (True) or magnitude spectrum (False)
+        
+        Returns
+        -------
+        np.ndarray
+            Shape (T,), rolloff frequency in Hz per frame
         """
         key = f"spectral_roll_{roll_percent}_{'pow' if use_power else 'mag'}"
         if key in self._cache_freq:
@@ -214,10 +225,12 @@ class FrequencyFeatures():
             if total <= 0.0:
                 rolloff_freq[t] = 0.0
                 continue
+
             cumsum = np.cumsum(spec)
             idx = np.searchsorted(cumsum, thresh*total)
             if idx >= K:
                 idx = K - 1
+
             rolloff_freq[t] = freqs[idx]
 
         self._cache_freq[key] = rolloff_freq
@@ -225,9 +238,19 @@ class FrequencyFeatures():
 
     def _spectral_slope(self, use_power=True, log_amp=False):
         """
-        Spectral Slope per frame, from linear regression of S over frequency
-
-        If log_amp=True, regress on log(S); otherwise on S directly
+        Spectral Slope per frame (linear regression of spectrum over frequency).
+        
+        Parameters
+        ----------
+        use_power : bool, default True
+            Use power spectrum (True) or magnitude spectrum (False)
+        log_amp : bool, default False
+            Regress on log(S) if True, else on S directly
+        
+        Returns
+        -------
+        np.ndarray
+            Shape (T,), slope value per frame
         """
         key = f"spectral_slope_{'pow' if use_power else 'mag'}_{'log' if log_amp else 'lin'}"
         if key in self._cache_freq:
@@ -244,9 +267,9 @@ class FrequencyFeatures():
 
         slopes = np.zeros(T, dtype=float)
         for t in range(T):
-            y = S[:, t]
+            y = S[:, t].astype(float)
             if log_amp:
-                y = np.log(y + EPS)
+                y = np.log(np.maximum(y, EPS))
 
             y_mean = np.mean(y)
             y_centered = y - y_mean
@@ -446,11 +469,11 @@ class FrequencyFeatures():
             num = 0.0
             den = 0.0
 
-            for i, f_p in enumerate(peak_freqs, start=1):
-                h = i
-                ideal = h*f0_t
-                num += (h**2)*(f_p - ideal)**2
-                den += (h**2)*(f0_t**2)
+            for f_p in peak_freqs:
+                h = max(1, int(round(f_p / f0_t)))  # nearest harmonic number
+                ideal = h * f0_t
+                num += (h**2) * (f_p - ideal)**2
+                den += (h**2) * (f0_t**2)
 
             inh[t] = num/(den + EPS)
 
@@ -543,10 +566,8 @@ class FrequencyFeatures():
                 hnr_db[t] = 60.0 # arbitrary high cap
             else:
                 hnr_db[t] = 10*np.log10(E_h/(E_n + EPS))
-
-        if f0_hz is None:
-            self._cache_freq[key] = hnr_db
-
+            
+        self._cache_freq[key] = hnr_db
         return hnr_db
     
     def _spectral_envelope_bands(self, bands):
@@ -795,9 +816,6 @@ class FrequencyFeatures():
             mad = np.median(np.abs(flux - med)) + EPS
             threshold = med + 4*mad  # Stricter than before
         
-        # Use scipy's find_peaks for robust detection
-        from scipy.signal import find_peaks
-        
         peaks, _ = find_peaks(
             flux,
             height=threshold,        # Above threshold
@@ -896,7 +914,7 @@ class FrequencyFeatures():
             return self._cache_freq[key]
         
         X = self.X
-        phi = np.unwrap(np.angle(X), axis=0)
+        phi = np.unwrap(np.angle(X), axis=1)
 
         self._cache_freq[key] = phi
         return phi
@@ -966,10 +984,10 @@ class FrequencyFeatures():
         if key in self._cache_freq:
             return self._cache_freq[key]
         
-        X = self._power_spectrum() if use_power else self._magnitude_spectrum()
+        weights_S = self._power_spectrum() if use_power else self._magnitude_spectrum()
         phi = self._phase()
 
-        weights = np.maximum(X, EPS)
+        weights = np.maximum(weights_S, EPS)
         vec = np.sum(weights*np.exp(1j*phi), axis=0)
         denom = np.sum(weights, axis=0) + EPS
         pc = np.abs(vec)/denom
@@ -1185,24 +1203,6 @@ class FrequencyFeatures():
         return ratio
     
     # Spotify-based Frequency Features
-    def _safe_band_mask(self, f_lo, f_hi):
-        return (self.freqs >= f_lo) & (self.freqs <= f_hi)
-    
-    def _sub_band_energy_ratios(self, n_bands=12, use_power=True, fmin=50.0, fmax=None):
-        key = f"sub_band_energy_ratios_{n_bands}_{'pow' if use_power else 'mag'}_{fmin}_{fmax}"
-        if key in self._cache_freq:
-            return self._cache_freq[key]
-
-        if fmax is None:
-            fmax = self.sr/2.0
-
-        edges = np.linspace(fmin, fmax, n_bands + 1)
-        bands = [(edges[i], edges[i + 1]) for i in range (n_bands)]
-        R = self._band_ratios(bands, use_power=use_power, relative=True)
-
-        self._cache_freq[key] = R
-        return R
-    
     def _pitch_class_profile(self, use_power=True):
         """
         Mean energy pooled into 12 pitch classes from the STFT bins.
@@ -1322,7 +1322,7 @@ class FrequencyFeatures():
                 val = -80.0
             else:
                 thr = np.median(frame_energy) + np.std(frame_energy)
-                acive = frame_energy >= thr
+                active = frame_energy >= thr
                 if not np.any(active):
                     active = frame_energy > 0
                 if not np.any(active):
@@ -1393,7 +1393,7 @@ class FrequencyFeatures():
         self._cache_freq[key] = energy_normalized
         return energy_normalized
 
-    def _speechiness_freq(self):
+    def _speechiness_freq(self) -> float:
         key = "speechiness_freq"
         if key in self._cache_freq:
             return self._cache_freq[key]
@@ -1401,15 +1401,20 @@ class FrequencyFeatures():
         flat = self._spectral_flatness(use_power=True)
         entr = self._spectral_entropy(use_power=True, normalize=True)
         flux = self._spectral_flux(use_power=True, normalize=True, half_wave_rectify=True)
-        mid_ratio = self._band_ratios([(300.0, 3000.0)], relative=True)[0]
+
+        # Safely extract mid-band ratio
+        band_ratios = self._band_ratios([(300.0, 3000.0)], relative=True)
+        mid_ratio = band_ratios[0] if band_ratios.size > 0 else np.zeros(1, dtype=float)
         
-        z = 0.35*np.mean(flat) + 0.25*np.mean(entr) + 0.25*np.mean(np.clip(flux/(np.mean(flux) + EPS), 0.0, 1.0)) + 0.15*np.mean(mid_ratio)
+        z = (0.35*np.mean(flat) + 0.25*np.mean(entr) + 
+             0.25*np.mean(np.clip(flux/(np.mean(flux) + EPS), 0.0, 1.0)) + 
+             0.15*np.mean(mid_ratio))
         val = safe_clip01(z)
 
         self._cache_freq[key] = val
         return val
 
-    def _acousticness_freq(self):
+    def _acousticness_freq(self) -> float:
         key = "acousticness_freq"
         if key in self._cache_freq:
             return self._cache_freq[key]
@@ -1419,7 +1424,10 @@ class FrequencyFeatures():
         roll = self._spectral_rolloff(roll_percent=0.85, use_power=True)
         slope = self._spectral_slope(use_power=True, log_amp=True)
         harm = self._harmonic_ratio()
-        high_ratio = self._band_ratios([(6000.0, self.sr/2.0)], relative=True)[0]
+
+        # Safely extract high-band ratio
+        band_ratios = self._band_ratios([(6000.0, self.sr/2.0)], relative=True)
+        high_ratio = band_ratios[0] if band_ratios.size > 0 else np.zeros(1, dtype=float)
 
         c_score = 1.0 - np.mean(np.clip(cent/(self.sr/2.0), 0.0, 1.0))
         r_score = 1.0 - np.mean(np.clip(roll/(self.sr/2.0), 0.0, 1.0))
@@ -1786,7 +1794,8 @@ class FrequencyFeatures():
         if weights is None:
             weights = np.array([0.12, 0.12, 0.08, 0.10, 0.12, 0.08, 0.08, 0.10, 0.12, 0.06, 0.05, 0.07], dtype=float)
 
-        fused = float(np.sum(vals * weights) / (np.sum(weights) + EPS))
+        w_sum = np.sum(weights)
+        fused = float(np.dot(vals, weights) / w_sum) if w_sum > 0 else 0.0
 
         return {
             "loudness_db": loudness,

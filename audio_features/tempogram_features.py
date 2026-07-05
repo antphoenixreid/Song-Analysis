@@ -411,7 +411,7 @@ class TempogramFeatures:
 
                 # Only consider if in valid range
                 if candidate_bpm > bpm_max:
-                    break
+                    continue
 
                 # Find closest bin
                 candidate_idx = np.argmin(np.abs(bpm - candidate_bpm))
@@ -608,6 +608,7 @@ class TempogramFeatures:
 
         if l["bpm_curve"].size == 0:
             result = {
+                "curve": np.array([], dtype=float),
                 "variation": np.array([], dtype=float),
                 "abs_variation": np.array([], dtype=float)
             }
@@ -617,6 +618,7 @@ class TempogramFeatures:
         
         variation = l["bpm_curve"] - g["bpm"]
         result = {
+            "curve": np.abs(variation).astype(float),
             "variation": variation.astype(float),
             "abs_variation": np.abs(variation).astype(float),
             "times": l["times"]
@@ -1337,11 +1339,12 @@ class TempogramFeatures:
         phase = (t - beat_times[idx])/(beat_times[idx + 1] - beat_times[idx] + EPS)
         phase = np.mod(phase, 1.0)
 
-        if mode in ("phase", "fractional"):
+        if mode == "phase":
             pos = phase
+        elif mode == "fractional":
+            pos = (t - beat_times[idx])/(beat_period + EPS)
         elif mode == "nearest":
-            pos = phase
-            pos = np.where(pos > 0.5, pos - 1.0, pos)
+            pos = np.where(phase > 0.5, phase - 1.0, phase)
         else:
             raise ValueError("mode must be 'phase', 'fractional', or 'nearest'")
         
@@ -1396,7 +1399,9 @@ class TempogramFeatures:
         """
         Variance of inter-beat intervals, optionally normalized by mean interval
         """
-        key = f"interbeat_interval_variance_{normalize}"
+        bt_hash = hash(beat_times.tobytes()) if beat_times is not None else "none"
+        bf_hash = hash(tuple(beat_frames)) if beat_frames is not None else "none"
+        key = f"interbeat_interval_variance_{normalize}_{bt_hash}_{bf_hash}"
         if key in self._cache_tempogram:
             return self._cache_tempogram[key]
         
@@ -1443,11 +1448,11 @@ class TempogramFeatures:
         if beat_times is None:
             beat_times = self._beat_time_from_frames(beat_frames)
 
-        if event_times is None:
+        if event_times is None and event_frames is not None:
+            event_times = librosa.frames_to_time(np.asarray(event_frames, dtype=int), sr=self.sr, hop_length=self.H)
+        elif event_times is None:
             onset = self._onset_strength()
             event_times = onset["times"]
-        elif event_times is None and event_frames is not None:
-            event_times = librosa.frames_to_time(np.asarray(event_frames, dtype=int), sr=self.sr, hop_length=self.H)
 
         beat_times = np.asarray(beat_times, dtype=float)
         event_times = np.asarray(event_times, dtype=float)
@@ -1557,8 +1562,8 @@ class TempogramFeatures:
         
         pulse = self._pulse_clarity(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum)["clarity"]
         stab = self._tempo_stability_index(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum)["stability"]
-        beat_strength = self._beat_strength(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum)["strength"]
-        multi = self._multi_periodic_structure(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum)["multi_periodicity"]
+        beat_strength = self._beat_periodicity_strength(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum)["strength"]
+        multi = self._multi_periodic_structure(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum)["score"]
         var = self._beat_fluctuation_rate(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum)
 
         val = float(np.clip(
@@ -1632,7 +1637,7 @@ class TempogramFeatures:
 
         pulse = self._pulse_clarity(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum)["clarity"]
         rep = self._beat_periodicity_strength(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum)["strength"]
-        multi = self._multi_periodic_structure(bpm_min=bpm_min, bpm_max=bpm_max, norm_score=norm_sum)["score"]
+        multi = self._multi_periodic_structure(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum)["score"]
         stab = self._tempo_stability_index(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum)["stability"]
 
         major_score = float(np.clip(0.35*stab + 0.30*pulse + 0.20*rep + 0.15*(1.0 - np.clip(multi/2.0, 0.0, 1.0)), 0.0, 1.0))

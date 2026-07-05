@@ -7,7 +7,7 @@ import numpy as np
 import librosa
 from scipy.signal import find_peaks
 from scipy.ndimage import maximum_filter
-from typing import Tuple, Optional, Dict
+from typing import Tuple, Optional, Dict, Any
 
 # ---------- Utilities ----------
 EPS = 1e-10
@@ -103,3 +103,12 @@ def confidence_weighted(value, confidence, neutral=0.5):
         return neutral
 
     return value
+
+def _safe_float(x: Any, default: float = 0.0) -> float:
+    try:
+        v = float(x)
+        if np.isfinite(v):
+            return v
+    except Exception:
+        pass
+    return float(default)
