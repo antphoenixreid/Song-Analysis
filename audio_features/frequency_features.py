@@ -22,16 +22,8 @@ class FrequencyFeatures():
             self.y = np.pad(self.y, (0, pad), mode="constant")
 
         # Run STFT on signal
-        self.X = librosa.stft(
-            self.y,
-            n_fft=self.N,
-            hop_length=self.H,
-            win_length=self.N,
-            window="hann",
-            center=True
-        )
-
-        self.freqs = librosa.fft_frequencies(sr=self.sr, n_fft=self.N)
+        self.X = sig.stft
+        self.freqs = sig.fft_freqs
 
         self._cache_freq = {}
 
@@ -53,7 +45,10 @@ class FrequencyFeatures():
             return self._cache_freq["pow"]
         
         mag = self._magnitude_spectrum()
-        power = mag**2
+    
+        # Hann window power normalization factor: sum(w^2) = 0.375 * N
+        win_power_factor = 0.375
+        power = (mag**2) / (float(self.N) * win_power_factor)
 
         self._cache_freq["pow"] = power
         return power
@@ -97,7 +92,9 @@ class FrequencyFeatures():
             return self._cache_freq["frame_energy_db"]
 
         e = self._frame_energy()
-        e_db = 10.0*np.log10(e + EPS)
+        # Normalize by frame length N and Hann window factor (0.375)
+        e_norm = e / (float(self.N) * 0.375 + EPS)
+        e_db = 10.0 * np.log10(e_norm + EPS)
 
         self._cache_freq["frame_energy_db"] = e_db
         return e_db
@@ -279,7 +276,7 @@ class FrequencyFeatures():
         self._cache_freq[key] = slopes
         return slopes
 
-    def _spectral_skewness(self, use_power=True):
+    def _spectral_skewness(self, use_power=True, energy_thresh=1e-7, max_skew=50.0):
         """
         Spectral skewness per frame (standardized third central moment)
         """
@@ -290,24 +287,38 @@ class FrequencyFeatures():
         S = self._power_spectrum() if use_power else self._magnitude_spectrum()
         freqs = self.freqs[..., None]
 
-        S_sum = np.sum(S, axis=0, keepdims=True) + EPS
-        p = S/S_sum
+        S_sum = np.sum(S, axis=0, keepdims=True)
 
+        # Mask near-silent frames where spectral moments are undefined/unstable
+        valid_mask = (S_sum.squeeze(0) > energy_thresh)
+
+        p = S/(S_sum + EPS)
         centroid = self._spectral_centroid(use_power=use_power)[None, :]
 
         diffs = freqs - centroid
-        mu2 = np.sum((diffs**2)*p, axis=0) + EPS
+
+        # Second and third central moments
+        mu2 = np.sum((diffs**2)*p, axis=0)
         mu3 = np.sum((diffs**3)*p, axis=0)
 
+        # Enforce minimum variance floor (1.0 Hz^2) to prevent zero-division explosion
+        mu2 = np.maximum(mu2, 1.0)
+
         skew = mu3/(mu2**1.5)
+
+        # Zero out invalid/silent frames and clip outliers
+        skew[~valid_mask] = 0.0
+        skew = np.clip(skew, -max_skew, max_skew)
 
         self._cache_freq[key] = skew
         return skew
 
-    def _spectral_kurtosis(self, use_power=True, excess=True):
+    def _spectral_kurtosis(self, use_power=True, excess=True, energy_thresh=1e-7, max_kurt=100.0):
         """
-        Spectral kurtosis per frame (standardized fourth central moment)
-        If excess=True subtract 3 (Gaussian baseline)
+        Spectral kurtosis per frame (standardized fourth central moment).
+        
+        Includes energy masking, variance flooring, and clipping 
+        to prevent numerical explosion on narrowband/silent frames.
         """
         key = f"spectral_kurtosis_{'pow' if use_power else 'mag'}_{'excess' if excess else 'raw'}"
         if key in self._cache_freq:
@@ -316,18 +327,31 @@ class FrequencyFeatures():
         S = self._power_spectrum() if use_power else self._magnitude_spectrum()
         freqs = self.freqs[..., None]
 
-        S_sum = np.sum(S, axis=0, keepdims=True) + EPS
-        p = S/S_sum
+        S_sum = np.sum(S, axis=0, keepdims=True)
+        
+        # Mask near-silent frames where spectral moments are undefined/unstable
+        valid_mask = (S_sum.squeeze(0) > energy_thresh)
 
+        p = S / (S_sum + EPS)
         centroid = self._spectral_centroid(use_power=use_power)[None, :]
 
         diffs = freqs - centroid
-        mu2 = np.sum((diffs**2)*p, axis=0) + EPS
-        mu4 = np.sum((diffs**4)*p, axis=0)
+        
+        # Second and fourth central moments
+        mu2 = np.sum((diffs ** 2) * p, axis=0)
+        mu4 = np.sum((diffs ** 4) * p, axis=0)
 
-        kurt = mu4/(mu2**2)
+        # Enforce minimum variance floor (1.0 Hz^2) to prevent zero-division explosion
+        mu2_safe = np.maximum(mu2, 1.0)
+
+        kurt = mu4 / (mu2_safe ** 2.0)
+        
         if excess:
             kurt = kurt - 3.0
+
+        # Zero out invalid/silent frames and clip outliers
+        kurt[~valid_mask] = 0.0
+        kurt = np.clip(kurt, -max_kurt, max_kurt)
 
         self._cache_freq[key] = kurt
         return kurt
@@ -789,45 +813,41 @@ class FrequencyFeatures():
         self._cache_freq[key] = periodicity
         return periodicity
     
-    def _transient_counts(self, use_power=True, normalize=True, half_wave_rectify=True, threshold=None):
-        """
-        Count onset-envelope peaks above threshold
-        If threshold is None, uses a robust adaptive threshold
-        Returns:
-            counts: integer count of transient-like peaks
-        """
-        key = f"transient_counts_{'pow' if use_power else 'mag'}_{'norm' if normalize else 'raw'}_{'hwr' if half_wave_rectify else 'full'}"
+    def _transient_counts(
+        self,
+        use_power=True,
+        normalize=True,
+        half_wave_rectify=True,
+        threshold_factor=1.5,
+    ):
+        key = f"transient_counts_{'pow' if use_power else 'mag'}_{threshold_factor}"
         if key in self._cache_freq:
             return self._cache_freq[key]
-        
+
         flux = self._spectral_flux(
             use_power=use_power,
             normalize=normalize,
-            half_wave_rectify=half_wave_rectify
+            half_wave_rectify=half_wave_rectify,
         )
-
         if flux.size < 3:
             self._cache_freq[key] = 0
             return 0
-        
-        # Adaptive threshold
-        if threshold is None:
-            med = np.median(flux)
-            mad = np.median(np.abs(flux - med)) + EPS
-            threshold = med + 4*mad  # Stricter than before
-        
-        peaks, _ = find_peaks(
-            flux,
-            height=threshold,        # Above threshold
-            prominence=threshold*0.2, # Must stand out
-            distance=3               # At least 3 frames apart
-        )
 
-        count = int(len(peaks))
+        med = np.median(flux)
+        mad = np.median(np.abs(flux - med)) + EPS
+        thr = med + threshold_factor * mad
+
+        # Convert 30 ms transient separation constraint into frame counts
+        fs_env = float(self.sr) / float(self.H)
+        min_distance = max(1, int(round(fs_env * 0.030)))
+
+        peaks, _ = find_peaks(flux, height=thr, distance=min_distance)
+        count = int(peaks.size)
+
         self._cache_freq[key] = count
         return count
     
-    def _transient_rate(self, use_power=True, normalize=True, half_wave_rectify=True, threshold=None):
+    def _transient_rate(self, use_power=True, normalize=True, half_wave_rectify=True, threshold_factor=1.5):
         """
         Transient count normalized by track duration in seconds
         """
@@ -839,7 +859,7 @@ class FrequencyFeatures():
             use_power=use_power,
             normalize=normalize,
             half_wave_rectify=half_wave_rectify,
-            threshold=threshold
+            threshold_factor=threshold_factor
         )
 
         n_frames = max(1, self._spectral_flux(
@@ -867,11 +887,13 @@ class FrequencyFeatures():
         freqs = self.freqs
         K, T = S.shape
 
-        flux = self._spectral_flux(
+        flux_raw = self._spectral_flux(
             use_power=use_power,
             normalize=True,
             half_wave_rectify=True
         )
+        flux = np.zeros(T, dtype=float)
+        flux[:flux_raw.size] = flux_raw
 
         if flux.size != T:
             flux = np.resize(flux, T)
@@ -1441,44 +1463,25 @@ class FrequencyFeatures():
         self._cache_freq[key] = val
         return val
 
-    def _danceability_freq(self):
-        key = "danceability_freq"
+    def _danceability_freq(self, tempo=None) -> float:
+        key = f"danceability_freq_{tempo}"
         if key in self._cache_freq:
             return self._cache_freq[key]
 
-        flux = self._spectral_flux(use_power=True, normalize=True, half_wave_rectify=True)
-        if flux.size < 10:
-            self._cache_freq[key] = 0.0
-            return 0.0
-        
-        # Detect rhythmic periodicity using autocorrelation
-        flux_centered = flux - np.mean(flux)
-        ac = np.correlate(flux_centered, flux_centered, mode="full")
-        ac = ac[ac.size//2:]
+        pulse = self._beat_periodicity()
+        flux = self._spectral_flux(use_power=True)
+        flux_std = float(np.std(flux)) if flux.size > 0 else 0.0
 
-        if ac[0] > 0:
-            ac = ac/ac[0]
+        if tempo is None:
+            tempo = self._tempo_freq()
 
-        # Look for peaks in the autocorrelation to find periodicity
-        frame_rate = self.sr/float(self.H)
-        lag_min = int(frame_rate*60/160)  # Max 160 BPM
-        lag_max = int(frame_rate*60/80)   # Min 80 BPM
+        # Penalize extreme tempi (<70 or >160 BPM)
+        tempo_factor = 1.0 - safe_clip01(abs(tempo - 115.0) / 115.0)
+        z = 0.45 * pulse + 0.35 * tempo_factor + 0.20 * safe_clip01(flux_std)
 
-        if lag_min < lag_max < len(ac):
-            periodicity = float(np.max(ac[lag_min:lag_max]))
-        else:
-            periodicity = 0.0
-
-        # Flux energy (percussive has high flux)
-        flux_energy = float(np.mean(flux))
-        flux_norm = np.tanh(flux_energy*3.0)
-
-        # Combine
-        danceability = 0.7*periodicity + 0.3*flux_norm
-        danceability = float(np.clip(danceability, 0.0, 1.0))
-
-        self._cache_freq[key] = danceability
-        return danceability
+        val = safe_clip01(z)
+        self._cache_freq[key] = val
+        return val
     
     def _valence_freq(self):
         key = "valence_freq"
@@ -1755,44 +1758,81 @@ class FrequencyFeatures():
         self._cache_freq[key] = val
         return val
 
-    def spotify_audio_features(self, weights=None):
-        loudness = self._loudness_freq_db()
-        energy = self._energy_freq(weighted=True)
+    def spotify_audio_features(
+        self,
+        weights=None,
+        primary_bpm=None,
+        global_loudness_db=None,
+    ):
+        # Parameter injection guard for loudness and tempo
+        loudness = (
+            float(global_loudness_db)
+            if global_loudness_db is not None
+            else self._loudness_freq_db()
+        )
+        tempo = (
+            float(primary_bpm)
+            if primary_bpm is not None and primary_bpm > 0
+            else self._tempo_freq()
+        )
+
+        energy = self._energy_freq()
         speechiness = self._speechiness_freq()
         acousticness = self._acousticness_freq()
-        danceability = self._danceability_freq()
+        danceability = self._danceability_freq(tempo=tempo)
         valence = self._valence_freq()
-        tempo = self._tempo_freq()
         liveness = self._liveness_freq()
         instrumentalness = self._instrumentalness_freq()
         key = self._key_freq()
         mode = self._mode_freq()
         time_signature = self._time_signature_freq()
 
+        # Feature scaling for Spotify fusion
         loudness_score = safe_clip01((loudness + 80.0) / 80.0)
-        energy_score = safe_clip01(energy / (energy + 1.0))
+        energy_score = safe_clip01(energy)
         tempo_score = safe_clip01(tempo / 240.0)
-        key_score = safe_clip01(key / 11.0)
+        key_score = safe_clip01(key / 11.0 if key >= 0 else 0.0)
         mode_score = 1.0 if mode == "major" else 0.0
-        time_sig_score = 1.0 if time_signature == 4 else 0.5 if time_signature == 3 else 0.0
+        time_sig_score = (
+            1.0 if time_signature == 4 else 0.5 if time_signature == 3 else 0.0
+        )
 
-        vals = np.array([
-            loudness_score,
-            energy_score,
-            speechiness,
-            acousticness,
-            danceability,
-            valence,
-            tempo_score,
-            liveness,
-            instrumentalness,
-            key_score,
-            mode_score,
-            time_sig_score,
-        ], dtype=float)
+        vals = np.array(
+            [
+                loudness_score,
+                energy_score,
+                speechiness,
+                acousticness,
+                danceability,
+                valence,
+                tempo_score,
+                liveness,
+                instrumentalness,
+                key_score,
+                mode_score,
+                time_sig_score,
+            ],
+            dtype=float,
+        )
 
         if weights is None:
-            weights = np.array([0.12, 0.12, 0.08, 0.10, 0.12, 0.08, 0.08, 0.10, 0.12, 0.06, 0.05, 0.07], dtype=float)
+            weights = np.array(
+                [
+                    0.12,
+                    0.12,
+                    0.08,
+                    0.10,
+                    0.12,
+                    0.08,
+                    0.08,
+                    0.10,
+                    0.12,
+                    0.06,
+                    0.05,
+                    0.07,
+                ],
+                dtype=float,
+            )
 
         w_sum = np.sum(weights)
         fused = float(np.dot(vals, weights) / w_sum) if w_sum > 0 else 0.0
@@ -1810,5 +1850,5 @@ class FrequencyFeatures():
             "key": key,
             "mode": mode,
             "time_signature": time_signature,
-            "spotify_fused": float(np.clip(fused, 0.0, 1.0)),
+            "spotify_fused": fused,
         }

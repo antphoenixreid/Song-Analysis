@@ -41,10 +41,11 @@ class MFCCFeatures:
             self._compute_mfcc()
 
     def _compute_mfcc(self):
-        key = f"mfcc_default"
+        key = "mfcc_default"
         if key in self._cache_mfcc:
             return self._cache_mfcc[key]
-        
+
+        # 1. Compute Mel Spectrogram (Linear Power)
         self.S = librosa.feature.melspectrogram(
             y=self.y,
             sr=self.sr,
@@ -62,14 +63,13 @@ class MFCCFeatures:
             dtype=self.dtype
         )
 
+        # 2. Convert to dB scale for local inspection/caching
+        # Pass ref=np.max if relative peak normalization is desired, or ref=1.0
         self.S_db = librosa.power_to_db(self.S, ref=np.max)
-        if self.log_mels:
-            S_in = np.log(self.S + EPS)
-        else:
-            S_in = self.S_db
 
+        # 3. Compute MFCC cleanly from LINEAR power S (Librosa applies power_to_db internally)
         self.mfcc = librosa.feature.mfcc(
-            S=S_in,
+            S=librosa.power_to_db(self.S, ref=1.0), # OR pass linear S directly if dct handling requires power
             sr=self.sr,
             n_mfcc=self.n_mfcc,
             dct_type=self.dct_type,
@@ -366,38 +366,22 @@ class MFCCFeatures:
 
     # Envelope Features
     def _mfcc_attack_smoothness(self, attack_frames=None, normalize=True):
-        key = f"mfcc_attack_smoothness_normalize_{attack_frames}_{normalize}"
+        # Fix key collision string
+        key = f"mfcc_attack_smoothness_frames_{attack_frames}_norm_{normalize}"
         if key in self._cache_mfcc:
             return self._cache_mfcc[key]
         
         if self.mfcc is None or self.mfcc.size == 0:
-            result = 0.0
-            self._cache_mfcc[key] = result
-            return result
+            return 0.0
         
-        X = self.mfcc
-        T = X.shape[1]
+        # Look across low-order coefficients to trace real transient contours
+        mfcc_diff = np.diff(self.mfcc[1:5, :], axis=1)
+        attk_var = np.var(mfcc_diff)
 
-        if attack_frames is None:
-            attack_frames = max(2, min(T//5, 10))
-        attack_frames = int(max(2, min(attack_frames, T)))
-
-        segment = X[:, :attack_frames]
-        diff = np.diff(segment, axis=1)
-        step_energy = np.linalg.norm(diff, axis=0)
-
-        if step_energy.size == 0:
-            result = 1.0
-            self._cache_mfcc[key] = result
-            return result
+        # Scale dynamically based on variance variance patterns
+        smoothness = float(1.0 / (1.0 + attk_var * 0.05))
+        smoothness = float(np.clip(smoothness, 0.0, 1.0))
         
-        if normalize:
-            denom = np.max(np.linalg.norm(segment, axis=0)) + EPS
-            smoothness = 1.0 / (1.0 + np.mean(step_energy) / denom)
-        else:
-            smoothness = 1.0/(1.0 + np.mean(step_energy))
-
-        smoothness = float(safe_clip01(smoothness))
         self._cache_mfcc[key] = smoothness
         return smoothness
     
@@ -591,19 +575,25 @@ class MFCCFeatures:
         self._cache_mfcc[key] = E
         return E
 
-    def _mfcc_energy(self, normalize=True):
-        key = f"mfcc_energy_normalize_{normalize}"
+    def _mfcc_energy(self):
+        """Calculates dynamic MFCC energy without self-normalizing max locks"""
+        key = "mfcc_energy"
         if key in self._cache_mfcc:
             return self._cache_mfcc[key]
-
-        E = self._mfcc_frame_energy(normalize=normalize)
-        if E.size == 0:
-            result = 0.0
-        else:
-            result = float(np.mean(E))
-
-        self._cache_mfcc[key] = result
-        return result
+        
+        if self.mfcc is None or self.mfcc.size == 0:
+            return 0.0
+            
+        # Compute root-mean-square energy over the low coefficients 
+        # to find true average frame power across time
+        raw_energy = np.sqrt(np.mean(self.mfcc[0, :]**2))
+        
+        # Soft-scale relative to a baseline to ensure unique variation
+        val = float(raw_energy / (raw_energy + 50.0))
+        val = float(np.clip(val, 0.0, 1.0))
+        
+        self._cache_mfcc[key] = val
+        return val
 
     def _mfcc_rms_energy(self, normalize=True):
         key = f"mfcc_rms_energy_normalize_{normalize}"
@@ -724,7 +714,7 @@ class MFCCFeatures:
         if key in self._cache_mfcc:
             return self._cache_mfcc[key]
 
-        loud = self._mfcc_energy(normalize=True)
+        loud = self._mfcc_energy()
 
         self._cache_mfcc[key] = loud
         return loud
@@ -734,11 +724,11 @@ class MFCCFeatures:
         if key in self._cache_mfcc:
             return self._cache_mfcc[key]
         
-        e0 = self._mfcc_spectral_slope_proxy(coeff=0, aggregate="rms")
+        e0 = self._mfcc_spectral_slope_proxy(coeff=0, aggregate="rms")/100
         e1 = self._mfcc_rms_energy(normalize=True)
-        e2 = self._mfcc_energy(normalize=True)
+        e2 = self._mfcc_energy()
 
-        val = float(np.clip(0.4*abs(e0) + 0.3*e1 + 0.3*e2, 0.0, 1.0))
+        val = float(np.clip(0.5*abs(e0) + 0.25*e1 + 0.25*e2, 0.0, 1.0))
 
         self._cache_mfcc[key] = val
         return val

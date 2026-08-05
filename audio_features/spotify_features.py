@@ -5,9 +5,9 @@ from typing import Any, Dict, Sequence
 
 import numpy as np
 
-from audio_signal import AudioSignal
-from feature_extractor import FeatureExtractor
-from utils import EPS, safe_clip01, _safe_float
+from audio_features.audio_signal import AudioSignal
+from audio_features.feature_extractor import FeatureExtractor
+from audio_features.utils import EPS, safe_clip01, _safe_float
 
 @dataclass
 class SpotifyFusion:

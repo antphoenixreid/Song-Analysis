@@ -6,7 +6,7 @@ import os
 import logging
 import numpy as np
 from typing import Dict, Optional
-from .utils import safe_load
+from audio_features.utils import safe_load
 
 logger = logging.getLogger(__name__)
 
@@ -22,21 +22,28 @@ class AudioSignal:
         self.N = N
         self.H = H
 
-        if audio_path is not None:
-            # load
+        # ALWAYS initialize the cache and invalid flag first
+        self._cache: Dict[str, object] = {}
+        self._invalid: bool = False
+
+        if signal is not None:
+            self.y = np.asarray(signal, dtype=np.float32)
+            if sr is not None:
+                self.sr = sr
+            invalid = False
+        elif audio_path is not None:
             if not isinstance(audio_path, str):
                 raise ValueError("audio_path must be a string path")
             if not os.path.exists(audio_path):
                 raise FileNotFoundError(f"Audio file not found: {audio_path}")
 
             self.y, self.sr, invalid = safe_load(audio_path)
-        elif signal is not None:
-            # accept provided signal; prefer float32 for memory/compat
-            self.y = np.asarray(signal, dtype=np.float32)
-            self.sr = DEFAULT_SR
-            invalid = False
         else:
             raise ValueError("Must provide either 'audio_path' or 'signal'")
+
+        if invalid:
+            self._invalid = True
+            return
 
         # If multi-channel, convert to mono by averaging channels
         if getattr(self.y, "ndim", 0) > 1:
@@ -58,13 +65,8 @@ class AudioSignal:
         # -----------------------------
         # GLOBAL VALIDITY CHECKS
         # -----------------------------
-        self._invalid: bool = False
 
-        if invalid:
-            self._invalid = True
-            return
-
-        # failed load / empty file
+        # Check for empty array safely
         if self.y is None or self.y.size == 0:
             self._invalid = True
             return
@@ -80,9 +82,6 @@ class AudioSignal:
             self._invalid = True
             return
 
-        # compute once lazily — requires cache initialized
-        self._cache: Dict[str, object] = {}
-
     # Backwards-compatible property
     @property
     def invalid(self) -> bool:
@@ -93,3 +92,34 @@ class AudioSignal:
     def is_valid(self) -> bool:
         """Readable convenience: True if signal passed validation."""
         return not self._invalid
+    
+    # Add these properties inside the AudioSignal class in audio_features/audio_signal.py
+    @property
+    def stft(self) -> np.ndarray:
+        """Computes the STFT matrix once and caches it globally for all modules."""
+        if "stft" not in self._cache:
+            import librosa
+            self._cache["stft"] = librosa.stft(
+                self.y,
+                n_fft=self.N,
+                hop_length=self.H,
+                win_length=self.N,
+                window="hann",
+                center=True
+            )
+        return self._cache["stft"]
+
+    @property
+    def stft_mag(self) -> np.ndarray:
+        """Caches the magnitude spectrum so modules don't re-run np.abs() on massive arrays."""
+        if "stft_mag" not in self._cache:
+            self._cache["stft_mag"] = np.abs(self.stft)
+        return self._cache["stft_mag"]
+
+    @property
+    def fft_freqs(self) -> np.ndarray:
+        """Caches the FFT frequency bins."""
+        if "fft_freqs" not in self._cache:
+            import librosa
+            self._cache["fft_freqs"] = librosa.fft_frequencies(sr=self.sr, n_fft=self.N)
+        return self._cache["fft_freqs"]

@@ -243,10 +243,10 @@ class TimeFeatures():
             return self._cache_time[key]
         
         rms_env = self._rms_envelope()
-        rms_dB = 20.0 * np.log10(rms_env + EPS)
-        
+        rms_db = 20.0*np.log10(rms_env + EPS)
+
         onsets = self._onset_frames()
-        
+
         if len(onsets) == 0:
             self._cache_time[key] = 0.0
             return 0.0
@@ -255,27 +255,33 @@ class TimeFeatures():
         for onset_frame in onsets:
             start = max(0, onset_frame - 5)
             end = min(len(rms_env), onset_frame + 20)
-            segment = rms_dB[start:end]  # ← Use dB, not linear
-            
+            segment = rms_db[start:end]
+
             if len(segment) < 3:
                 continue
-            
-            peak_val = np.max(segment)
-            threshold_10 = peak_val - 0.1 * (peak_val - np.min(segment))  # 10% of range
-            threshold_90 = peak_val - 0.9 * (peak_val - np.min(segment))  # 90% of range
-            
+
+            min_val = np.min(segment)
+            max_val = np.max(segment)
+            val_range = max_val - min_val
+
+            if val_range < 1e-4:
+                continue
+
+            threshold_10 = min_val + 0.1*val_range
+            threshold_90 = min_val + 0.9*val_range
+
             idx_10 = np.where(segment >= threshold_10)[0]
             idx_90 = np.where(segment >= threshold_90)[0]
-            
+
             if len(idx_10) > 0 and len(idx_90) > 0:
                 t_10 = idx_10[0]
                 t_90 = idx_90[0]
-                
+
+                # An attack rises forward over time
                 if t_90 > t_10:
-                    # Slope in dB/second
                     db_change = segment[t_90] - segment[t_10]
-                    time_change = (t_90 - t_10) * self.H / self.sr
-                    slope = db_change / (time_change + EPS)
+                    time_change = (t_90 - t_10)*self.H/self.sr
+                    slope = db_change/(time_change + EPS)
                     attack_slopes.append(slope)
         
         if len(attack_slopes) == 0:
@@ -517,24 +523,42 @@ class TimeFeatures():
         
         ste = self._short_time_energy()
 
-        # Adaptive threshold (median + factor*MAD)
-        median = np.median(ste)
-        mad = np.median(np.abs(ste - median))
-        threshold = median + 2.0*mad
+        # Normalize STE to [0, 1] range
+        ste_max = np.max(ste) + EPS
+        ste_norm = ste / ste_max
 
-        peaks, _ = find_peaks(ste, height=threshold)
+        # Compute frame rate for short-time energy
+        # Uses self.H if defined, otherwise defaults to self.sr
+        frame_rate = float(self.sr) / float(getattr(self, 'H', 1))
 
-        duration = len(self.y)/float(self.sr)
-        rate = float(len(peaks))/duration
+        # 1. Compute robust stats on normalized energy
+        median = np.median(ste_norm)
+        mad = np.median(np.abs(ste_norm - median))
+        
+        # Adaptive prominence threshold
+        min_prominence = max(0.05, 1.0 * mad)
+        
+        # Min distance between transients (~30ms)
+        min_distance = max(1, int(0.030 * frame_rate))
+
+        # 2. Peak picking via local prominence
+        peaks, _ = find_peaks(
+            ste_norm, 
+            prominence=min_prominence,
+            distance=min_distance
+        )
+
+        duration = len(self.y) / float(self.sr)
+        rate = float(len(peaks)) / duration
 
         self._cache_time[key] = rate
         return rate
 
     def _transient_counts(self) -> int:
         rate = self._transient_rate()
-        duration = len(self.y)/float(self.sr)
+        duration = len(self.y) / float(self.sr)
 
-        return int(round(rate*duration))
+        return int(round(rate * duration))
     
     # Rhythm/Beats Features
     def _onset_times(self) -> np.ndarray:
@@ -1174,43 +1198,44 @@ class TimeFeatures():
         if "lz_complexity" in self._cache_time:
             return self._cache_time["lz_complexity"]
         
-        x = self.y.astype(float)
-        n = len(x)  # ← Use signal length, NOT frame length
+        # 1. COMPUTE ON ENVELOPE (Slashes array size from millions to thousands)
+        # Using librosa's root-mean-square feature acts as a massive downsampler
+        rms_env = librosa.feature.rms(y=self.y, frame_length=self.N, hop_length=self.H)[0]
+        
+        n = len(rms_env)
         if n < 2:
             self._cache_time["lz_complexity"] = 0.0
             return 0.0
         
-        # Binary symbolic sequence
-        thr = np.median(x)
-        s = (x > thr).astype(int)
+        # 2. Binary symbolic sequence quantization around the median
+        thr = np.median(rms_env)
+        s = (rms_env > thr).astype(int)
+        
+        # Pack into a standard Python string for fast matching
         seq = "".join(s.astype(str))
         
-        # LZ76 parsing (unchanged)
+        # 3. Optimized LZ76 parsing loop
         i = 0
         c = 1
         k = 1
-        while True:
-            if i + k > n:  # ← Use n, not N
-                c += 1
-                break
+        while i + k <= n:
             sub = seq[i:i + k]
+            # Check if the substring exists anywhere in the sequence examined so far
             if seq[:i + k - 1].find(sub) != -1:
                 k += 1
             else:
                 c += 1
                 i += k
                 k = 1
-            if i + k > n:  # ← Use n, not N
-                break
-        
-        # Normalize by signal length, not frame length
+
+        # 4. Normalize by the envelope length n
         c = float(c)
         if n > 1:
-            c_norm = c / (n / np.log(n))  # ← Use n
+            c_norm = c / (n / np.log(n))
         else:
             c_norm = 0.0
-    
-        c_norm = float(max(0.0, c_norm))
+
+        c_norm = float(max(0.0, min(1.0, c_norm)))
         self._cache_time["lz_complexity"] = c_norm
         return c_norm 
     
@@ -1223,20 +1248,25 @@ class TimeFeatures():
         if key in self._cache_time:
             return self._cache_time[key]
         
-        x = self.y.astype(float)
-        n = len(x)  # ← Use signal length
+        # 1. COMPUTE ON ENVELOPE (Reduces array size from millions to thousands)
+        rms_env = librosa.feature.rms(y=self.y, frame_length=self.N, hop_length=self.H)[0]
+        
+        x = rms_env.astype(float)
+        n = len(x)  # Frame length (~10,000 instead of 5,000,000+)
+        
         if n < 2 or k_max < 2:
-            self._cache_time[key] = 1.0  # ← Return 1.0, not 0.0 (smooth signal)
+            self._cache_time[key] = 1.0
             return 1.0
         
         k_max = min(k_max, n - 1)
         Lk = []
         ln_k = []
         
+        # 2. Algorithmic loops now process safely sized arrays
         for k in range(1, k_max + 1):
             Lm = []
             for m in range(k):
-                idxs = np.arange(m, n, k)  # ← Use n
+                idxs = np.arange(m, n, k)
                 if idxs.size < 2:
                     continue
                 
@@ -1244,8 +1274,8 @@ class TimeFeatures():
                 diff = np.abs(np.diff(x_m)).sum()
                 n_m = idxs.size
                 
-                # Higuchi length
-                L_mk = (diff * (n - 1) / ((n_m - 1) * k)) / k  # ← Use n
+                # Higuchi normalization length formula
+                L_mk = (diff * (n - 1) / ((n_m - 1) * k)) / k
                 Lm.append(L_mk)
             
             if len(Lm) == 0:
@@ -1257,12 +1287,7 @@ class TimeFeatures():
         Lk = np.array(Lk, dtype=float)
         ln_k = np.array(ln_k, dtype=float)
         
-        if Lk.size < 2:
-            self._cache_time[key] = 1.0  # ← Default to smooth
-            return 1.0
-        
-        # Guard against zero/negative Lk (happens for constant signals)
-        if np.any(Lk <= 0):
+        if Lk.size < 2 or np.any(Lk <= 0):
             self._cache_time[key] = 1.0
             return 1.0
         

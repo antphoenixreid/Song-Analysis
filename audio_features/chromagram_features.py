@@ -7,6 +7,22 @@ import librosa
 from .utils import EPS, safe_clip01
 from .audio_signal import AudioSignal
 
+# Standard Temperley Pitch Profiles (Major / Minor)
+TEMPERLEY_MAJOR = np.array([5.0, 2.0, 3.5, 2.0, 4.5, 4.0, 2.0, 4.5, 2.0, 3.5, 1.5, 4.0])
+TEMPERLEY_MINOR = np.array([5.0, 2.0, 3.5, 4.5, 2.0, 4.0, 2.0, 4.5, 3.5, 2.0, 1.5, 4.0])
+
+def _build_centered_key_templates():
+    templates = np.zeros((24, 12), dtype=float)
+    for i in range(12):
+        templates[i] = np.roll(TEMPERLEY_MAJOR, i)
+        templates[i + 12] = np.roll(TEMPERLEY_MINOR, i)
+    
+    # Mean-center templates to eliminate DC offset / background energy bias
+    templates_centered = templates - np.mean(templates, axis=1, keepdims=True)
+    norms = np.linalg.norm(templates_centered, axis=1, keepdims=True) + EPS
+    return templates_centered / norms
+
+KEY_TEMPLATES_NORM = _build_centered_key_templates()
 
 class ChromagramFeatures():
     def __init__(self, sig: AudioSignal):
@@ -16,16 +32,9 @@ class ChromagramFeatures():
         self.N = sig.N
         self.H = sig.H
 
-        self.X = librosa.stft(
-            self.y,
-            n_fft=self.N,
-            hop_length=self.H,
-            win_length=self.N,
-            window="hann",
-            center=True
-        )
-        self.X_mag = np.abs(self.X)
-        self.freqs = librosa.fft_frequencies(sr=self.sr, n_fft=self.N)
+        self.X = sig.stft
+        self.X_mag = sig.stft_mag
+        self.freqs = sig.fft_freqs
 
         self._cache_chroma = {}
 
@@ -100,15 +109,19 @@ class ChromagramFeatures():
         return C/S
     
     def _chroma_profile(self, normalize=True, use_db=False):
-        C = self._chroma()                          # always start linear
+        C = self._chroma_db() if use_db else self._chroma()
+
+        self.raw_chroma_energy = np.linalg.norm(C, axis=0)
+
         if normalize:
             colsum = np.sum(C, axis=0, keepdims=True)
-            zero_cols = colsum <= EPS
-            C = C / (colsum + EPS)
-            if np.any(zero_cols):
-                C[:, zero_cols[0]] = 1.0 / 12.0
-        if use_db:
-            C = 10.0 * np.log10(C + EPS)           # convert after normalization
+            nonzero_mask = colsum > EPS
+
+            # Mask zero-energy frames to avoid needless division by EPS
+            C_norm = np.full_like(C, 1.0/12.0)
+            np.divide(C, colsum, out=C_norm, where=nonzero_mask)
+            C = C_norm
+        
         return C
 
     def _mean_chroma(self, normalize=True, use_db=False):
@@ -228,17 +241,23 @@ class ChromagramFeatures():
             return self._cache_chroma[key]
 
         P = self._chroma_profile(normalize=normalize, use_db=use_db)
-        mu = self._chroma_centroid(normalize=normalize, use_db=use_db)
+        mean_profile = np.mean(P, axis=1)
 
-        # Map mu to fractional chroma [0, 12)
-        centroid_idx = (12.0*mu/(2.0*np.pi))%12.0
+        # Compute circular mean angle (mu)
+        angles = np.linspace(0, 2*np.pi, 12, endpoint=False)
+        sin_sum = np.sum(mean_profile*np.sin(angles))
+        cos_sum = np.sum(mean_profile*np.cos(angles))
+        mu = np.arctan2(sin_sum, cos_sum)
 
-        idx = np.arange(12)[:, None]
-        dist = np.minimum(np.abs(idx - centroid_idx[None, :]), 12 - np.abs(idx - centroid_idx[None, :]))
-        spread = np.sqrt(np.sum((dist**2)*P, axis=0))
+        # Angular distance delta_theta in [-pi, pi)
+        angle_diffs = np.arctan2(np.sin(angles - mu), np.cos(angles - mu))
 
-        self._cache_chroma[key] = spread
-        return spread
+        # Circular Spread (Variance)
+        total_power = np.sum(mean_profile) + EPS
+        spread = np.sum(mean_profile*(angle_diffs**2))/total_power
+
+        self._cache_chroma[key] = float(spread)
+        return float(spread)
 
     def _chroma_skewness(self, normalize=True, use_db=False):
         """
@@ -253,20 +272,21 @@ class ChromagramFeatures():
             return self._cache_chroma[key]
 
         P = self._chroma_profile(normalize=normalize, use_db=use_db)
-        mu = self._chroma_centroid(normalize=normalize, use_db=use_db)
-        centroid_idx = (12.0*mu/(2.0*np.pi))%12.0
+        mean_profile = np.mean(P, axis=1)
 
-        idx = np.arange(12)[:, None]
-        abs_dist = np.minimum(np.abs(idx - centroid_idx[None, :]), 12 - np.abs(idx - centroid_idx[None, :]))
-        signed_dist = (idx - centroid_idx[None, :] + 6) % 12 - 6  # wraps to [-6, 6)
+        angles = np.linspace(0, 2*np.pi, 12, endpoint=False)
+        sin_sum = np.sum(mean_profile*np.sin(angles))
+        cos_sum = np.sum(mean_profile*np.cos(angles))
+        mu = np.arctan2(sin_sum, cos_sum)
 
-        m2 = np.sum((abs_dist**2)*P, axis=0)
-        m3 = np.sum((signed_dist**3)*P, axis=0)   # signed — allows negative skew
+        angle_diffs = np.arctan2(np.sin(angles - mu), np.cos(angles - mu))
+        total_power = np.sum(mean_profile) + EPS
 
-        skew = m3/(np.power(m2, 1.5) + EPS)
+        std = np.sqrt(np.sum(mean_profile*(angle_diffs**2))/total_power) + EPS
+        skew = np.sum(mean_profile*(angle_diffs**3))/(total_power*(std**3))
         
-        self._cache_chroma[key] = skew
-        return skew
+        self._cache_chroma[key] = float(skew)
+        return float(skew)
     
     def _chroma_kurtosis(self, normalize=True, use_db=False, excess=True):
         """
@@ -281,22 +301,21 @@ class ChromagramFeatures():
             return self._cache_chroma[key]
 
         P = self._chroma_profile(normalize=normalize, use_db=use_db)
-        mu = self._chroma_centroid(normalize=normalize, use_db=use_db)
-        centroid_idx = (12.0*mu/(2.0*np.pi))%12.0
+        mean_profile = np.mean(P, axis=1)
 
-        idx = np.arange(12)[:, None]
-        dist = np.minimum(np.abs(idx - centroid_idx[None, :]), 12 - np.abs(idx - centroid_idx[None, :]))
+        angles = np.linspace(0, 2*np.pi, 12, endpoint=False)
+        sin_sum = np.sum(mean_profile*np.sin(angles))
+        cos_sum = np.sum(mean_profile*np.cos(angles))
+        mu = np.arctan2(sin_sum, cos_sum)
 
-        m2 = np.sum((dist**2)*P, axis=0)
-        m4 = np.sum((dist**4)*P, axis=0)
+        angle_diffs = np.arctan2(np.sin(angles - mu), np.cos(angles - mu))
+        total_power = np.sum(mean_profile) + EPS
 
-        kurt = m4/(np.square(m2) + EPS)
+        var = (np.sum(mean_profile*(angle_diffs**2))/total_power) + EPS
+        kurt = (np.sum(mean_profile*(angle_diffs**4))/(total_power*(var**2))) - 3.0
 
-        if excess:
-            kurt = kurt - 3.0
-
-        self._cache_chroma[key] = kurt
-        return kurt
+        self._cache_chroma[key] = float(kurt)
+        return float(kurt)
     
     def _chroma_template(self):
         """
@@ -371,7 +390,7 @@ class ChromagramFeatures():
         self._cache_chroma[key] = result
         return result
     
-    def _harmonic_entropy(self, normalize=True, use_db=False, method="cosine", beta=1.0):
+    def _harmonic_entropy(self, normalize=True, use_db=False, method="cosine", beta=10.0):
         """
         Entropy of the key estimation scores across all templates, normalized by log(num_templates)
         Higher values indicate a more ambiguous tonal center, while lower values indicate a clearer key
@@ -943,7 +962,7 @@ class ChromagramFeatures():
         self._cache_chroma[key] = val
         return val
     
-    def _key_estimation(self, normalize=True, use_db=False, method="cosine"):
+    def _key_estimation(self, normalize=True, use_db=False, method="correlation"):
         """
         Estimate the key of the audio signal
         Returns:
@@ -958,28 +977,32 @@ class ChromagramFeatures():
             return self._cache_chroma[key]
         
         P = self._mean_chroma(normalize=normalize, use_db=use_db)
-        T = self._chroma_template()
 
-        if method == "cosine":
-            Pn = P/(np.linalg.norm(P) + EPS)
-            Tn = T/(np.linalg.norm(T, axis=1, keepdims=True) + EPS)
-            scores = Tn @ Pn
-        elif method == "dot":
-            scores = T @ P
-        else:
-            raise ValueError(f"Unsupported method: {method}")
-        
+        # Mean-center the track chromagram
+        P_centered = P - np.mean(P)
+        P_norm = P_centered/(np.linalg.norm(P_centered) + EPS)
+
+        # Pearson Correlation against all 24 centered major/minor profiles
+        scores = KEY_TEMPLATES_NORM @ P_norm
+
         key_idx = int(np.argmax(scores))
         tonic = key_idx%12
-        mode = "maj" if key_idx < 12 else "min"
+        mode = "major" if key_idx < 12 else "minor"
         score = float(scores[key_idx])
+
+        # Extract relative major vs minor confidence for the best tonic
+        score_major = float(scores[tonic])
+        score_minor = float(scores[tonic + 12])
 
         result = {
             "key_idx": key_idx,
             "tonic": tonic,
             "mode": mode,
             "score": score,
-            "scores": scores
+            "scores": scores,
+            "score_major": score_major,
+            "score_minor": score_minor,
+            "delta_score": float(score_major - score_minor)
         }
 
         self._cache_chroma[key] = result
@@ -990,14 +1013,38 @@ class ChromagramFeatures():
         if key in self._cache_chroma:
             return self._cache_chroma[key]
 
-        # fit = self._harmonic_template_fit(normalize=normalize, use_db=use_db, method="dot")["best_score"]
+        # 1. Measure raw acoustic magnitude energy before L1 profile normalization
+        C = self._chroma_db() if use_db else self._chroma()
+
+        # Compute RMS energy across chroma bins and temporal frames
+        if C.size == 0:
+            raw_magnitude_energy = 0.0
+        else:
+            frame_norms = np.linalg.norm(C, axis=0) # L2 norm per frame
+            raw_magnitude_energy = float(np.mean(frame_norms))
+
+        # Robust log-scale normalization: log1p compresses large values,
+        # /8.0 puts typical chroma energies (exp(8) ≈ 3000 linear) in [0,1]
+        norm_energy = safe_clip01(np.log1p(raw_magnitude_energy) / 8.0)
+
+        # 2. Compute tonal structural components
         fit_res = self._harmonic_template_fit(normalize=normalize, use_db=use_db, method="dot")
         fit = fit_res["best_score"] if isinstance(fit_res, dict) else float(fit_res)
 
         spread = self._chroma_spread(normalize=normalize, use_db=use_db)
         stability = self._tonal_stability(normalize=normalize, use_db=use_db)
 
-        val = safe_clip01(0.35*fit + 0.35*stability + 0.3*(1.0 - np.mean(spread)))
+        MAX_CHROMA_SPREAD = np.pi # Max angular distance on circle
+        norm_spread = np.mean(spread)/MAX_CHROMA_SPREAD
+        spread_compactness = safe_clip01(1.0 - norm_spread)
+
+        # 3. Fuse unnormalized magnitude energy with tonal focus/stability
+        val = safe_clip01(
+            0.50*norm_energy +
+            0.20*fit +
+            0.15*stability +
+            0.15*spread_compactness
+        )
 
         self._cache_chroma[key] = val
         return val
@@ -1011,8 +1058,9 @@ class ChromagramFeatures():
         flux = self._chroma_flux_mean(normalize=normalize, use_db=use_db)
         var = self._chroma_flux_variance(normalize=normalize, use_db=use_db)
         repetitive = self._chroma_repetition(normalize=normalize, use_db=use_db)
+        energy = self._energy_chroma(normalize=normalize, use_db=use_db)
 
-        val = safe_clip01(0.4*ent + 0.25*np.tanh(flux) + 0.20*np.tanh(var) + 0.15*(1.0 - repetitive))
+        val = safe_clip01(0.35*ent + 0.25*np.tanh(flux) + 0.20*np.tanh(var) + 0.10*(1.0 - repetitive) + 0.10*(1.0 - energy))
 
         self._cache_chroma[key] = val
         return val
@@ -1026,8 +1074,9 @@ class ChromagramFeatures():
         stability = self._tonal_stability(normalize=normalize, use_db=use_db)
         entropy = self._chroma_entropy(normalize=normalize, use_db=use_db)
         flux = self._chroma_flux_mean(normalize=normalize, use_db=use_db)
+        energy = self._energy_chroma(normalize=normalize, use_db=use_db)
 
-        val = safe_clip01(0.35*fit + 0.30*stability + 0.20*(1.0 - entropy) + 0.15*(1.0 - np.tanh(flux)))
+        val = safe_clip01(0.30*fit + 0.25*stability + 0.20*(1.0 - entropy) + 0.15*(1.0 - np.tanh(flux)) + 0.10*(1.0 - energy))
 
         self._cache_chroma[key] = val
         return val
@@ -1041,8 +1090,9 @@ class ChromagramFeatures():
         smooth = self._chroma_smoothness(normalize=normalize, use_db=use_db, metric="l2")["smoothness"]
         stability = self._tonal_stability(normalize=normalize, use_db=use_db)
         flux = self._chroma_flux_mean(normalize=normalize, use_db=use_db)
+        energy = self._energy_chroma(normalize=normalize, use_db=use_db)
 
-        val = safe_clip01(0.35*rep + 0.25*smooth + 0.20*stability + 0.20*(1.0 - np.tanh(flux)))
+        val = safe_clip01(0.30*rep + 0.20*smooth + 0.20*stability + 0.15*(1.0 - np.tanh(flux)) + 0.15*energy)
 
         self._cache_chroma[key] = val
         return val
@@ -1099,8 +1149,9 @@ class ChromagramFeatures():
         stability = self._tonal_stability(normalize=normalize, use_db=use_db)
         entropy = self._chroma_entropy(normalize=normalize, use_db=use_db)
         tonal_focus = self._pitch_class_peakedness(normalize=normalize, use_db=use_db)
+        energy = self._energy_chroma(normalize=normalize, use_db=use_db)
 
-        val = safe_clip01(0.35*fit + 0.25*stability + 0.20*tonal_focus + 0.20*(1.0 - entropy))
+        val = safe_clip01(0.30*fit + 0.25*stability + 0.20*tonal_focus + 0.15*(1.0 - entropy) + 0.10*energy)
 
         self._cache_chroma[key] = val
         return val
@@ -1133,16 +1184,16 @@ class ChromagramFeatures():
         if key in self._cache_chroma:
             return self._cache_chroma[key]
         
-        result = self._key_estimation(normalize=normalize, use_db=use_db, method=method)
-        tonic = result["tonic"]
-        score_major = result["scores"][tonic]
-        score_minor = result["scores"][tonic + 12]
+        key_res = self._key_estimation(normalize=normalize, use_db=use_db, method=method)
+        tonic = key_res["tonic"]
+        scores = key_res["scores"]
+
+        score_major = float(scores[tonic])
+        score_minor = float(scores[tonic + 12])
         delta_score = score_major - score_minor
 
-        mode = "maj" if delta_score >= 0 else "min"
-
         result = {
-            "mode": mode,
+            "mode": key_res["mode"],
             "score_major": score_major,
             "score_minor": score_minor,
             "delta_score": delta_score

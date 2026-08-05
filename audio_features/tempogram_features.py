@@ -37,6 +37,124 @@ class TempogramFeatures:
 
         return log_S, filtered_bpm
 
+    def _get_default_beats(self):
+        """
+        Retrieve or compute beat tracking if not cached
+        """
+        if hasattr(self, "beat_times") and self.beat_times is not None:
+            return self.beat_times, self.beat_frames
+
+        # Run standard librosa beat tracker as fallback
+        tempo, beat_frames = librosa.beat.beat_track(
+            y=self.y, 
+            sr=self.sr, 
+            hop_length=self.H
+        )
+        beat_times = librosa.frames_to_time(beat_frames, sr=self.sr, hop_length=self.H)
+        return beat_times, beat_frames
+
+    def _apply_tempo_prior(self, bpms, strengths, mu=115.0, sigma=35.0):
+        """
+        Applies a Gaussian log-prior centered around nominal tempo (115 BPM) 
+        to smooth raw tempogram strengths before argmax peak selection.
+        """
+        bpms = np.asarray(bpms, dtype=float)
+        strengths = np.asarray(strengths, dtype=float)
+
+        # Empty or size mismatch guard
+        if bpms.size == 0 or strengths.size == 0 or bpms.shape != strengths.shape:
+            return np.array([], dtype=float)
+
+        # If all strengths are non-finite, return zeros to avoid NaNs
+        if not np.any(np.isfinite(strengths)):
+            return np.zeros_like(strengths, dtype=float)
+
+        # Gaussian weightng curve centered at 115.0 BPM
+        prior = np.exp(-0.5*((bpms - mu)/sigma)**2)
+        weighted_strengths = strengths*prior
+
+        # Heavily penalize extreme boundary candidates (< 60 BPM or > 190 BPM)
+        extreme_mask = (bpms < 60.0) | (bpms > 190.0)
+        weighted_strengths[extreme_mask] *= 0.15
+
+        return weighted_strengths
+
+    def _correct_octave_dips(
+        self,
+        detected_idx,
+        bpms,
+        global_ac,
+        bpm_min=40.0,
+        bpm_max=240.0,
+        fast_threshold=140.0,
+        slow_threshold=75.0,
+        down_ratio=0.80,
+        up_ratio=0.55
+    ):
+        """
+        Guards against octave halving (0.5x) and octave doubling (2x) 
+        using asymmetric strength thresholds and tempo-dependent guards.
+        """
+        bpms = np.asarray(bpms, dtype=float)
+        global_ac = np.asarray(global_ac, dtype=float)
+
+        # Basic index and shape guards
+        if bpms.size == 0 or global_ac.size == 0:
+            return None
+        if not (0 <= detected_idx < bpms.size and detected_idx < global_ac.size):
+            return None
+
+        detected_bpm = bpms[detected_idx]
+        detected_strength = global_ac[detected_idx]
+
+        best_idx = detected_idx
+        best_bpm = detected_bpm
+        best_strength = detected_strength
+
+        # 1. Downward Octave Guard (Check 0.5x and 0.25x)
+        # ONLY pull down if the original detected BPM is fast (> fast_threshold)
+        # AND the sub-harmonic strength is over 'down_ratio' of the primary peak strength
+        if detected_bpm > fast_threshold:
+            for divisor in [2.0, 4.0]:
+                candidate_bpm = detected_bpm/divisor
+                if candidate_bpm < bpm_min:
+                    continue
+
+                candidate_idx = int(np.argmin(np.abs(bpms - candidate_bpm)))
+                if not (0 <= candidate_idx < bpms.size and candidate_idx < global_ac.size):
+                    continue
+
+                candidate_strength = global_ac[candidate_idx]
+
+                if candidate_strength > down_ratio*detected_strength:
+                    best_bpm = candidate_bpm
+                    best_idx = candidate_idx
+                    best_strength = candidate_strength
+                    break
+
+        # 2. Upward Octave Guard (Check 2x and 3x)
+        # If detected tempo dropped into slow range (< slow_threshold), check for double-time harmonic.
+        elif detected_bpm < slow_threshold:
+            for multiplier in [2.0, 3.0]:
+                candidate_bpm = detected_bpm*multiplier
+                if candidate_bpm > bpm_max:
+                    continue
+
+                candidate_idx = int(np.argmin(np.abs(bpms - candidate_bpm)))
+                if not (0 <= candidate_idx < bpms.size and candidate_idx < global_ac.size):
+                    continue
+
+                candidate_strength = global_ac[candidate_idx]
+
+                # If double-time harmonic has at least 'up-ratio' of the slow peak strength, promote to 2x/3x
+                if candidate_strength > up_ratio*detected_strength:
+                    best_bpm = candidate_bpm
+                    best_idx = candidate_idx
+                    best_strength = candidate_strength
+                    break
+
+        return int(best_idx), float(best_bpm), float(best_strength)
+
     # Onset Strength Envelope
     def _onset_strength(self, max_size=1, detrend=False, aggregate=np.mean, smooth=False, smooth_width=5):
         key = f"onset_strength_max_{max_size}_detrend_{detrend}_{aggregate.__name__}_{smooth}_{smooth_width}"
@@ -365,86 +483,98 @@ class TempogramFeatures:
         return result
         
     def _global_bpm(self, bpm_min=40.0, bpm_max=240.0, norm_sum=True):
+        """
+        Estimate a single global BPM from the autocorrelation tempogram.
+
+        Returns:
+            dict with keys:
+                - "bpm": float (chosen BPM)
+                - "lag": int (lag index on bpm_axis)
+                - "strength": float (global_ac value at that lag)
+                - "bpm_axis": 1D array of BPMs (full axis)
+                - "global_ac": 1D array (global periodicity curve over lags)
+        """
         key = f"global_bpm_{bpm_min}_{bpm_max}_{norm_sum}"
         if key in self._cache_tempogram:
             return self._cache_tempogram[key]
-        
-        ac = self._tempogram_autocorr(norm_sum=norm_sum)
-        tg = ac['tempogram']
-        bpm = ac['bpm']
 
-        if tg.size == 0:
+        ac = self._tempogram_autocorr(norm_sum=norm_sum)
+        tg = ac["tempogram"]
+        bpm = ac["bpm"]
+
+        # Empty tempogram guard
+        if tg.size == 0 or bpm.size == 0:
             result = {
                 "bpm": 0.0,
                 "lag": 0,
                 "strength": 0.0,
-                "bpm_axis": bpm
+                "bpm_axis": bpm,
+                "global_ac": np.array([], dtype=float)
             }
             self._cache_tempogram[key] = result
             return result
-        
+
+        # Mask to valid BPM range and finite values
         mask = (bpm >= bpm_min) & (bpm <= bpm_max) & np.isfinite(bpm)
         if not np.any(mask):
             result = {
                 "bpm": 0.0,
                 "lag": 0,
                 "strength": 0.0,
-                "bpm_axis": bpm
+                "bpm_axis": bpm,
+                "global_ac": np.array([], dtype=float)
             }
             self._cache_tempogram[key] = result
             return result
-        
+
+        # Global periodicity curve (average over time)
         global_ac = np.mean(tg, axis=1)
 
-        search = global_ac[mask]
-
+        # Slice to valid search space
+        search_strengths = global_ac[mask]
+        search_bpms = bpm[mask]
         idxs = np.where(mask)[0]
-        best_rel = int(np.argmax(search))
-        best_idx = int(idxs[best_rel])
 
-        detected_bpm = float(bpm[best_idx])
-        detected_strength = float(global_ac[best_idx])
+        # Guard: if no finite strengths, return zero result
+        if not np.any(np.isfinite(search_strengths)) or search_strengths.size == 0:
+            result = {
+                "bpm": 0.0,
+                "lag": 0,
+                "strength": 0.0,
+                "bpm_axis": bpm,
+                "global_ac": global_ac
+            }
+            self._cache_tempogram[key] = result
+            return result
 
-        if detected_bpm < 80:
-            for multiplier in [2, 3, 4]:
-                candidate_bpm = detected_bpm*multiplier
+        # Stage 1: Prior-weighted candidate selection
+        weighted_strengths = self._apply_tempo_prior(
+            search_bpms, search_strengths, mu=115.0, sigma=35.0
+        )
 
-                # Only consider if in valid range
-                if candidate_bpm > bpm_max:
-                    continue
+        # Guard: if prior returns empty or all non-finite, fall back to raw strengths
+        if weighted_strengths is None or weighted_strengths.size == 0 or not np.any(np.isfinite(weighted_strengths)):
+            weighted_strengths = search_strengths.copy()
 
-                # Find closest bin
-                candidate_idx = np.argmin(np.abs(bpm - candidate_bpm))
-                candidate_strength = global_ac[candidate_idx]
+        best_rel = int(np.argmax(weighted_strengths))
+        primary_idx = int(idxs[best_rel])
 
-                # If octave multiple is at least 70% as strong, prefer it
-                if candidate_strength > 0.7*detected_strength:
-                    detected_bpm = float(bpm[candidate_idx])
-                    best_idx = int(candidate_idx)
-                    detected_strength = candidate_strength
-        elif detected_bpm > 200:
-            for divisor in [2, 3, 4]:
-                candidate_bpm = detected_bpm/divisor
+        # Stage 2: Asymmetric Octave Dip/Peak Guard
+        octave_result = self._correct_octave_dips(
+            primary_idx, bpm, global_ac, bpm_min=bpm_min, bpm_max=bpm_max
+        )
 
-                if candidate_bpm < bpm_min:
-                    break
-
-                candidate_idx = np.argmin(np.abs(bpm - candidate_bpm))
-                candidate_strength = global_ac[candidate_idx]
-
-                # Prefer sub-octave if it's reasonably strong
-                if candidate_strength > detected_strength:
-                    detected_bpm = float(bpm[candidate_idx])
-                    best_idx = int(candidate_idx)
-                    detected_strength = candidate_strength
-                    break
+        if octave_result is None:
+            final_idx, final_bpm, final_strength = primary_idx, float(bpm[primary_idx]), float(global_ac[primary_idx])
+        else:
+            final_idx, final_bpm, final_strength = octave_result
 
         result = {
-            "bpm": float(bpm[best_idx]),
-            "lag": int(best_idx),
-            "strength": float(global_ac[best_idx]),
+            "bpm": float(final_bpm),
+            "lag": int(final_idx),
+            "strength": float(final_strength),
             "bpm_axis": bpm,
-            "global_ac":global_ac
+            "global_ac": global_ac
         }
 
         self._cache_tempogram[key] = result
@@ -507,7 +637,7 @@ class TempogramFeatures:
             result = {
                 "clarity": 0.0,
                 "best_peak": 0.0,
-                "runner-up": 0.0
+                "runner_up": 0.0
             }
 
             self._cache_tempogram[key] = result
@@ -519,7 +649,7 @@ class TempogramFeatures:
             result = {
                 "clarity": 0.0,
                 "best_peak": 0.0,
-                "runner-up": 0.0
+                "runner_up": 0.0
             }
 
             self._cache_tempogram[key] = result
@@ -546,7 +676,7 @@ class TempogramFeatures:
         result = {
             "clarity": safe_clip01(clarity),
             "best_peak": best,
-            "runner-up": second
+            "runner_up": second
         }
 
         self._cache_tempogram[key] = result
@@ -647,48 +777,40 @@ class TempogramFeatures:
         if key in self._cache_tempogram:
             return self._cache_tempogram[key]
         
-        ac = self._tempogram_autocorr(norm_sum=norm_sum)
-        tg = ac["tempogram"]
-        bpm_axis = ac["bpm"]
+        # Use the octave-corrected global BPM as the authoritative primary_bpm
+        global_res = self._global_bpm(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum)
+        primary_bpm = global_res["bpm"]
+        primary_score = global_res["strength"]
 
-        if tg.size == 0:
+        if primary_bpm == 0.0 or global_res["global_ac"].size == 0:
             result = {
                 "score": 0.0,
                 "primary_bpm": 0.0,
                 "half_bpm": 0.0,
-                "double_bpm": 0.0
+                "double_bpm": 0.0,
+                "primary_score": 0.0,
+                "half_score": 0.0,
+                "double_score": 0.0
             }
-
             self._cache_tempogram[key] = result
             return result
-        
-        global_ac = np.mean(tg, axis=1)
-        mask = (bpm_axis >= bpm_min) & (bpm_axis <= bpm_max) & np.isfinite(bpm_axis)
-        idxs = np.where(mask)[0]
-        if idxs.size == 0:
-            result = {
-                "score": 0.0,
-                "primary_bpm": 0.0,
-                "half_bpm": 0.0,
-                "double_bpm": 0.0
-            }
 
-            self._cache_tempogram[key] = result
-            return result
-        
-        best_idx = int(idxs[np.argmax(global_ac[mask])])
-        primary_bpm = float(bpm_axis[best_idx])
+        bpm_axis = global_res["bpm_axis"]
+        global_ac = global_res["global_ac"]
+
         half_bpm = primary_bpm/2.0
         double_bpm = primary_bpm*2.0
 
         def nearest_val(target):
+            if bpm_axis.size == 0:
+                return 0.0, 0.0
             j = int(np.argmin(np.abs(bpm_axis - target)))
             return float(global_ac[j]), float(bpm_axis[j])
-        
+
         half_score, half_bpm_near = nearest_val(half_bpm)
         double_score, double_bpm_near = nearest_val(double_bpm)
-        primary_score = float(global_ac[best_idx])
 
+        # Compute multi-periodicity score relative to the corrected primary_bpm
         score = (half_score + double_score)/(primary_score + EPS)
 
         result = {
@@ -698,7 +820,7 @@ class TempogramFeatures:
             "double_bpm": double_bpm_near,
             "primary_score": primary_score,
             "half_score": half_score,
-            "double_score": double_score 
+            "double_score": double_score
         }
 
         self._cache_tempogram[key] = result
@@ -932,6 +1054,11 @@ class TempogramFeatures:
 
             if x.size < win_length:
                 continue
+
+            if len(x) > win_length:
+                x = x[:win_length]
+            elif len(x) < win_length:
+                x = np.pad(x, (0, win_length - len(x)), mode='constant')
 
             x = x - np.mean(x)
             X = np.fft.rfft(x*win_func, n=win_length)
@@ -1298,28 +1425,22 @@ class TempogramFeatures:
         Beat phase or position for each onset-envelope frame
         mode:
             - "phase": normalized phase in [0, 1) of the beat cycle
-            - "fractional": fractional position within the beat period (can be >1)
-            - "nearest": time to nearest beat (can be negative)
+            - "fractional": fractional position relative to the median beat period (can be >1)
+            - "nearest": signed phase offset to the nearest beat (in beat-phase units)
         """
-        key = f"beat_position_{mode}"
-        if key in self._cache_tempogram:
+        has_custom_beats = (beat_times is not None) or (beat_frames is not None)
+        key = f"bat_position_{mode}"
+        if not has_custom_beats and key in self._cache_tempogram:
             return self._cache_tempogram[key]
-        
+
         onset = self._onset_strength()
         t = onset["times"]
 
         if beat_times is None and beat_frames is None:
-            result = {
-                "beat_position": np.array([], dtype=float),
-                "beat_index": np.array([], dtype=int),
-                "beat_period": 0.0
-            }
+            beat_times, beat_frames = self._get_default_beats()
 
-            self._cache_tempogram[key] = result
-            return result
-        
         if beat_times is None:
-            beat_times = self._beat_time_from_frames(beat_frames)
+            beat_times = self._beat_time_from_frames(beat_frames=beat_frames)
 
         beat_times = np.asarray(beat_times, dtype=float)
         if beat_times.size < 2:
@@ -1328,33 +1449,55 @@ class TempogramFeatures:
                 "beat_index": np.array([], dtype=int),
                 "beat_period": 0.0
             }
-
-            self._cache_tempogram[key] = result
+            if not has_custom_beats:
+                self._cache_tempogram[key] = result
             return result
-        
-        beat_period = self._beat_period_from_beats(beat_times)
-        idx = np.searchsorted(beat_times, t, side="right") - 1
-        idx = np.clip(idx, 0, beat_times.size - 2)
 
-        phase = (t - beat_times[idx])/(beat_times[idx + 1] - beat_times[idx] + EPS)
-        phase = np.mod(phase, 1.0)
+        beat_period = float(self._beat_period_from_beats(beat_times))
+
+        idx = np.searchsorted(beat_times, t, side="right") - 1
+
+        idx_clamped = np.clip(idx, 0, beat_times.size - 2)
+        t_start = beat_times[idx_clamped]
+
+        # For frames beyond the last beat, extrapolate using the last IBI
+        last_ibi = beat_times[-1] - beat_times[-2] if beat_times.size >= 2 else (self.H/float(self.sr))
+        t_end_extrap = np.where(
+            idx_clamped < beat_times.size - 1,
+            beat_times[idx_clamped + 1],
+            beat_times[idx_clamped] + last_ibi
+        )
+        dt = t_end_extrap - t_start
+        dt[dt <= 0] = EPS
+
+        phase = (t - t_start)/dt
+        phase = np.clip(phase, 0.0, 1.0)
+
+        # Only mask frames that fall before the first beat
+        valid_mask = idx >= 0
+        phase[~valid_mask] = np.nan
 
         if mode == "phase":
             pos = phase
         elif mode == "fractional":
-            pos = (t - beat_times[idx])/(beat_period + EPS)
+            pos = (t -t_start)/(beat_period + EPS)
+            pos[~valid_mask] = np.nan
         elif mode == "nearest":
-            pos = np.where(phase > 0.5, phase - 1.0, phase)
+            nearest_beat = np.where(phase > 0.5, t_end_extrap, t_start)
+            pos = (t - nearest_beat)/(beat_period + EPS)
+            pos[~valid_mask] = np.nan
         else:
             raise ValueError("mode must be 'phase', 'fractional', or 'nearest'")
-        
+
         result = {
             "beat_position": pos.astype(float),
-            "beat_index": idx.astype(int),
+            "beat_index": np.where(valid_mask, idx, -1).astype(int),
             "beat_period": beat_period
         }
 
-        self._cache_tempogram[key] = result
+        if not has_custom_beats:
+            self._cache_tempogram[key] = result
+
         return result
     
     def _beat_alignment_histogram(self, beat_times=None, beat_frames=None, n_bins=16, normalize=True):
@@ -1368,21 +1511,23 @@ class TempogramFeatures:
         bp = self._beat_position(beat_times=beat_times, beat_frames=beat_frames, mode="phase")
         phase = bp["beat_position"]
 
-        if phase.size == 0:
+        # Filter out NaNs (out-of-bounds frames)
+        valid_phase = phase[np.isfinite(phase)]
+
+        if valid_phase.size == 0:
             hist = np.zeros(n_bins, dtype=float)
             result = {
                 "histogram": hist,
                 "bins": np.linspace(0, 1, n_bins + 1),
                 "peak_bin": -1
             }
-
             self._cache_tempogram[key] = result
             return result
         
-        hist, bins = np.histogram(phase, bins=n_bins, range=(0.0, 1.0))
+        hist, bins = np.histogram(valid_phase, bins=n_bins, range=(0.0, 1.0))
         hist = hist.astype(float)
         if normalize:
-            hist = hist/(np.sum(hist) + EPS)
+            hist = hist / (np.sum(hist) + EPS)
 
         peak_bin = int(np.argmax(hist)) if hist.size > 0 else -1
 
@@ -1405,9 +1550,9 @@ class TempogramFeatures:
         if key in self._cache_tempogram:
             return self._cache_tempogram[key]
         
+        # 1. Fallback to instance/computed beat tracking if None passed
         if beat_times is None and beat_frames is None:
-            self._cache_tempogram[key] = 0.0
-            return 0.0
+            beat_times, beat_frames = self._get_default_beats()
         
         if beat_times is None:
             beat_times = self._beat_time_from_frames(beat_frames)
@@ -1435,15 +1580,9 @@ class TempogramFeatures:
         if key in self._cache_tempogram:
             return self._cache_tempogram[key]
         
+        # 1. Fallback to instance/computed beat tracking if None passed
         if beat_times is None and beat_frames is None:
-            result = {
-                "offsets": np.array([], dtype=float),
-                "mean_offset": 0.0,
-                "mean_abs_offset": 0.0
-            }
-
-            self._cache_tempogram[key] = result
-            return result
+            beat_times, beat_frames = self._get_default_beats()
         
         if beat_times is None:
             beat_times = self._beat_time_from_frames(beat_frames)
@@ -1635,21 +1774,13 @@ class TempogramFeatures:
         if key in self._cache_tempogram:
             return self._cache_tempogram[key]
 
-        pulse = self._pulse_clarity(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum)["clarity"]
-        rep = self._beat_periodicity_strength(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum)["strength"]
-        multi = self._multi_periodic_structure(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum)["score"]
-        stab = self._tempo_stability_index(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum)["stability"]
-
-        major_score = float(np.clip(0.35*stab + 0.30*pulse + 0.20*rep + 0.15*(1.0 - np.clip(multi/2.0, 0.0, 1.0)), 0.0, 1.0))
-        minor_score = float(np.clip(0.65 - major_score, 0.0, 1.0))
-
-        mode = "major" if major_score >= minor_score else "minor"
-
+        # Tempo features carry no reliable major/minor signal.
+        # Return neutral scores and let Chroma/Frequency modules own mode.
         out = {
-            "mode": mode,
-            "score_major": major_score,
-            "score_minor": minor_score,
-            "delta_score": float(major_score - minor_score)
+            "mode":        "major",   # neutral default — will be overridden by fusion
+            "score_major": 0.5,
+            "score_minor": 0.5,
+            "delta_score": 0.0
         }
 
         self._cache_tempogram[key] = out
@@ -1666,36 +1797,51 @@ class TempogramFeatures:
         s = self._tempo_stability_index(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum)
 
         bpm = float(g["bpm"])
-        score = float(np.clip(
-            0.35 * m["score"] +
-            0.25 * p["clarity"] +
-            0.20 * s["stability"] +
-            0.20 * (1.0 - np.clip(abs(bpm - 120.0) / 120.0, 0.0, 1.0)),
+
+        structure_score = float(m.get("score", 0.0))
+        clarity_score = float(p.get("clarity", 0.0))
+        stability_score = float(s.get("stability", 0.0))
+
+        confidence = float(np.clip(
+            0.50 * structure_score +
+            0.30 * clarity_score +
+            0.20 * stability_score,
             0.0, 1.0
         ))
 
-        if score >= 0.60:
-            ts = 3 if m["half_bpm"] > 0 and abs(m["primary_bpm"] - 90.0) < abs(m["primary_bpm"] - 120.0) else 4
+        half_bpm = float(m.get("half_bpm", 0.0))
+        double_bpm = float(m.get("double_bpm", 0.0))
+        primary_bpm = float(m.get("primary_bpm", bpm))
+
+        is_triple_meter = False
+        if half_bpm > 0 and primary_bpm > 0:
+            ratio = half_bpm/primary_bpm
+
+            if abs(ratio - 0.333) < 0.08 or abs(ratio - 0.666) < 0.08:
+                is_triple_meter = True
+
+        if confidence >= 0.40:
+            ts = 3 if is_triple_meter else 4
         else:
-            ts = 4 if bpm >= 100.0 else 3
+            ts = 4
 
         out = {
             "time_signature": int(ts),
-            "confidence": score,
+            "confidence": confidence,
             "primary_bpm": bpm,
-            "structure_score": m["score"]
+            "structure_score": structure_score
         }
 
         self._cache_tempogram[key] = out
         return out
     
     def spotify_audio_features(self, beat_times=None, beat_frames=None, bpm_min=40.0, bpm_max=240.0, norm_sum=True):
-        loudness_per_beat = self._loudness_per_beat(beat_times=beat_times, beat_frames=beat_frames)
+        loudness_per_beat = self._loudness_tempogram_per_beat(beat_times=beat_times, beat_frames=beat_frames)
         return {
             "loudness_per_beat": loudness_per_beat,
-            "danceability": self._danceability(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum),
-            "valence": self._valence(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum),
-            "liveness": self._liveness(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum),
-            "mode": self._mode(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum)["mode"],
-            "time_signature": self._time_signature(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum)["time_signature"],
+            "danceability": self._danceability_tempogram(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum),
+            "valence": self._valence_tempogram(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum),
+            "liveness": self._liveness_tempogram(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum),
+            "mode": self._mode_tempogram(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum)["mode"],
+            "time_signature": self._time_signature_tempogram(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum)["time_signature"],
         }
