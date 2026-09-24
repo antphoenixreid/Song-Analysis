@@ -1,4 +1,4 @@
-from pathlib import Path
+﻿from pathlib import Path
 import os
 from concurrent.futures import ProcessPoolExecutor
 
@@ -182,7 +182,7 @@ def export_freq_debug_row(audio_path, sig):
 
     pc = ff._pitch_class_profile(use_power=True)
     key_mode = ff._estimate_key_mode_freq()
-    spotify = ff.spotify_audio_features()
+    spotify = ff.frequency_domain_evidence()
 
     frame_energy = ff._frame_energy()
     frame_energy_db = ff._frame_energy_db()
@@ -230,22 +230,25 @@ def export_freq_debug_row(audio_path, sig):
         "key": key_mode["tonic"],
         "mode": key_mode["mode"],
         "key_score": key_mode["score"],
-        "spotify_loudness_db": spotify["loudness_db"],
-        "spotify_energy": spotify["energy"],
-        "spotify_speechiness": spotify["speechiness"],
-        "spotify_acousticness": spotify["acousticness"],
-        "spotify_danceability": spotify["danceability"],
-        "spotify_valence": spotify["valence"],
-        "spotify_tempo_bpm": spotify["tempo_bpm"],
-        "spotify_liveness": spotify["liveness"],
-        "spotify_instrumentalness": spotify["instrumentalness"],
-        "spotify_key": spotify["key"],
-        "spotify_mode": spotify["mode"],
-        "spotify_time_signature": spotify["time_signature"],
-        "spotify_fused": spotify["spotify_fused"],
+        "rms_level_db": spotify["rms_level_db"],
+        "active_rms_level_db": spotify["active_rms_level_db"],
+        "spectral_energy_evidence": spotify["spectral_energy_evidence"],
+        "speech_band_evidence": spotify["speech_band_evidence"],
+        "acoustic_timbre_evidence": spotify["acoustic_timbre_evidence"],
+        "rhythmic_spectral_evidence": spotify["rhythmic_spectral_evidence"],
+        "brightness_valence_evidence": spotify["brightness_valence_evidence"],
+        "performance_variability_evidence": spotify["performance_variability_evidence"],
+        "non_vocal_spectral_evidence": spotify["non_vocal_spectral_evidence"],
+        "spectral_tempo_bpm": spotify["spectral_tempo_bpm"],
+        "key_tonic": spotify["key_tonic"],
+        "mode": spotify["mode"],
+        "key_confidence": spotify["key_confidence"],
+        "meter": spotify["meter"],
+        "meter_confidence": spotify["meter_confidence"],
+        "activity_confidence": spotify["activity_confidence"],
     }
 
-    row["status"] = status_from_values(row, ["frame_energy_mean", "key_score", "spotify_energy"])
+    row["status"] = status_from_values(row, ["frame_energy_mean", "key_score", "spectral_energy_evidence"])
     row["notes"] = ""
     return row
 
@@ -270,7 +273,7 @@ def export_chroma_debug_row(audio_path, sig):
     smoothness = cf._chroma_smoothness(normalize=True, use_db=False, metric="l2")
     dominant = cf._dominant_pitch_track(normalize=True, use_db=False)
     tuning = cf._tuning_deviation_detection(top_k=20)
-    spotify = cf.spotify_audio_features(normalize=True, use_db=False, method="cosine")
+    spotify = cf.chroma_domain_evidence(normalize=True, use_db=False, method="cosine")
 
     row = {
         "file_name": Path(audio_path).name,
@@ -299,18 +302,18 @@ def export_chroma_debug_row(audio_path, sig):
         "pitch_profile_9": float(pitch_profile[9].mean()),
         "pitch_profile_10": float(pitch_profile[10].mean()),
         "pitch_profile_11": float(pitch_profile[11].mean()),
-        "key_idx": key_res["key_idx"],
-        "tonic": key_res["tonic"],
+        "key_idx": key_res.get("key_idx"),
+        "tonic": key_res.get("key_tonic", key_res.get("tonic")),
         "mode": key_res["mode"],
         "key_score": key_res["score"],
         "mode_score_major": mode_res["score_major"],
         "mode_score_minor": mode_res["score_minor"],
-        "mode_delta_score": mode_res["delta_score"],
+        "mode_delta_score": mode_res.get("delta_score", mode_res.get("mode_delta")),
         "tonal_clarity": tonal_clarity["tonal_clarity"],
         "harmonic_entropy": harm_entropy["harmonic_entropy"],
         "raw_entropy": harm_entropy["raw_entropy"],
-        "consonance": cons_dis["consonance"],
-        "dissonance": cons_dis["dissonance"],
+        "consonance": cons_dis["tonal_coherence"],
+        "dissonance": cons_dis["tonal_incoherence"],
         "best_chord_idx": int(chord_det["chord_idx"][0]) if len(chord_det["chord_idx"]) > 0 else -1,
         "best_chord_score_first": float(chord_det["best_scores"][0]) if len(chord_det["best_scores"]) > 0 else 0.0,
         "harmonic_change_rate": harm_rhythm["change_rate"],
@@ -325,31 +328,31 @@ def export_chroma_debug_row(audio_path, sig):
         "dominant_pitch_mean": float(dominant.mean()) if dominant.size else 0.0,
         "track_cents": tuning["track_cents"],
         "mean_abs_cents": tuning.get("mean_abs_cents", 0.0),
-        "spotify_energy": spotify["energy"],
-        "spotify_speechiness": spotify["speechiness"],
-        "spotify_acousticness": spotify["acousticness"],
-        "spotify_danceability": spotify["danceability"],
-        "spotify_valence": spotify["valence"],
-        "spotify_tempo": spotify["tempo"],
-        "spotify_instrumentalness": spotify["instrumentalness"],
-        "spotify_key": spotify["key"],
-        "spotify_mode": spotify["mode"],
-        "spotify_time_signature": spotify["time_signature"],
+        "tonal_energy_evidence_domain": spotify["tonal_energy_evidence"],
+        "speech_tonal_evidence_domain": spotify["speech_tonal_evidence"],
+        "tonal_smoothness_evidence_domain": spotify["tonal_smoothness_evidence"],
+        "harmonic_repetitiveness_domain": spotify["harmonic_repetitiveness"],
+        "harmonic_valence_proxy_domain": spotify["harmonic_valence_proxy"],
+        "tonal_focus_evidence_domain": spotify["tonal_focus_evidence"],
+        "key_tonic_domain": spotify["key_tonic"],
+        "key_confidence_domain": spotify["key_confidence"],
+        "mode_domain": spotify["mode"],
+        "mode_value_domain": spotify["mode_value"],
+        "mode_confidence_domain": spotify["mode_confidence"],
         "chroma_entropy": cf._chroma_entropy(normalize=True, use_db=False),
         "chroma_flux_mean": cf._chroma_flux_mean(normalize=True, use_db=False),
         "chroma_flux_variance": cf._chroma_flux_variance(normalize=True, use_db=False),
         "harmonic_template_fit": cf._harmonic_template_fit(normalize=True, use_db=False, method="cosine")["best_score"],
         "pitch_class_peakedness": cf._pitch_class_peakedness(normalize=True, use_db=False),
-        "energy_chroma": cf._energy_chroma(normalize=True, use_db=False),
-        "speechiness_chroma": cf._speechiness_chroma(normalize=True, use_db=False),
-        "acousticness_chroma": cf._acousticness_chroma(normalize=True, use_db=False),
-        "danceability_chroma": cf._danceability_chroma(normalize=True, use_db=False),
-        "valence_chroma": cf._valence_chroma(normalize=True, use_db=False),
-        "tempo_chroma": cf._tempo_chroma(normalize=True, use_db=False),
-        "instrumentalness_chroma": cf._instrumentalness_chroma(normalize=True, use_db=False),
+        "tonal_energy_evidence": cf._tonal_energy_evidence(normalize=True, use_db=False),
+        "speech_tonal_evidence": cf._speech_tonal_evidence(normalize=True, use_db=False),
+        "tonal_smoothness_evidence": cf._tonal_smoothness_evidence(normalize=True, use_db=False),
+        "harmonic_repetitiveness": cf._harmonic_repetitiveness(normalize=True, use_db=False),
+        "harmonic_valence_proxy": cf._harmonic_valence_proxy(normalize=True, use_db=False),
+        "tonal_focus_evidence": cf._tonal_focus_evidence(normalize=True, use_db=False),
     }
 
-    row["status"] = status_from_values(row, ["energy_chroma", "harmonic_entropy", "key_score"])
+    row["status"] = status_from_values(row, ["tonal_energy_evidence", "harmonic_entropy", "key_score"])
     row["notes"] = ""
     return row
 
@@ -378,11 +381,11 @@ def export_tempo_debug_row(audio_path, sig):
     sync_offset = tf._beat_sync_offset(beat_frames=None, beat_times=None, event_frames=None, event_times=None, absolute=True)
     rhythmic_energy = tf._beat_periodic_energy(bpm_min=40.0, bpm_max=240.0, norm_sum=True)
     dance = tf._danceability_tempogram(bpm_min=40.0, bpm_max=240.0, norm_sum=True)
-    valence = tf._valence_tempogram(bpm_min=40.0, bpm_max=240.0, norm_sum=True)
-    liveness = tf._liveness_tempogram(bpm_min=40.0, bpm_max=240.0, norm_sum=True)
+    rhythmic_coherence = tf._rhythmic_coherence(bpm_min=40.0, bpm_max=240.0, norm_sum=True)
+    performance_variability = tf._tempo_performance_variability(bpm_min=40.0, bpm_max=240.0, norm_sum=True)
     mode = tf._mode_tempogram(bpm_min=40.0, bpm_max=240.0, norm_sum=True)
     tsig = tf._time_signature_tempogram(bpm_min=40.0, bpm_max=240.0, norm_sum=True)
-    spotify = tf.spotify_audio_features(beat_times=None, beat_frames=None, bpm_min=40.0, bpm_max=240.0, norm_sum=True)
+    spotify = tf.tempogram_domain_evidence(beat_times=None, beat_frames=None, bpm_min=40.0, bpm_max=240.0, norm_sum=True)
 
     row = {
         "file_name": Path(audio_path).name,
@@ -427,8 +430,8 @@ def export_tempo_debug_row(audio_path, sig):
         "sync_mean_offset_norm": sync_offset.get("mean_offset_norm", 0.0),
         "sync_mean_abs_offset_norm": sync_offset.get("mean_abs_offset_norm", 0.0),
         "danceability_tempogram": dance,
-        "valence_tempogram": valence,
-        "liveness_tempogram": liveness,
+        "rhythmic_coherence_tempogram": rhythmic_coherence,
+        "performance_variability_tempogram": performance_variability,
         "mode_tempogram": mode["mode"],
         "mode_major_score": mode["score_major"],
         "mode_minor_score": mode["score_minor"],
@@ -438,11 +441,11 @@ def export_tempo_debug_row(audio_path, sig):
         "time_signature_primary_bpm": tsig["primary_bpm"],
         "time_signature_structure_score": tsig["structure_score"],
         "spotify_loudness_per_beat_mean": float(spotify["loudness_per_beat"].mean()) if len(spotify["loudness_per_beat"]) else 0.0,
-        "spotify_danceability": spotify["danceability"],
-        "spotify_valence": spotify["valence"],
-        "spotify_liveness": spotify["liveness"],
-        "spotify_mode": spotify["mode"],
-        "spotify_time_signature": spotify["time_signature"],
+        "rhythmic_drive": spotify["rhythmic_drive"],
+        "tempo_valence_evidence": spotify["valence_evidence"],
+        "tempo_liveness_evidence": spotify["liveness_evidence"],
+        "tempo_mode_evidence": spotify["mode"],
+        "tempo_time_signature": spotify["time_signature"],
         "tempogram_autocorr_shape_0": int(temp_ac["tempogram"].shape[0]),
         "tempogram_autocorr_shape_1": int(temp_ac["tempogram"].shape[1]),
         "tempogram_fourier_shape_0": int(temp_f["tempogram"].shape[0]),
@@ -468,23 +471,19 @@ def export_mfcc_debug_row(audio_path, sig):
 
     loudness = mf._loudness_mfcc()
     energy = mf._energy_mfcc()
-    speechiness = mf._speechiness_mfcc()
-    acousticness = mf._acousticness_mfcc()
-    valence = mf._valence_mfcc()
-    liveness = mf._liveness_mfcc()
-    instrumentalness = mf._instrumentalness_mfcc()
-    spotify = mf.spotify_audio_features()
+    temporal_complexity = mf._mfcc_temporal_complexity()
+    timbre_smoothness = mf._mfcc_timbre_smoothness()
+    temporal_variability = mf._mfcc_temporal_variability()
+    spotify = mf.mfcc_domain_evidence()
 
     row = {
         "file_name": Path(audio_path).name,
         "file_path": str(audio_path),
         "mfcc_energy": energy,
         "mfcc_loudness": loudness,
-        "mfcc_speechiness": speechiness,
-        "mfcc_acousticness": acousticness,
-        "mfcc_valence": valence,
-        "mfcc_liveness": liveness,
-        "mfcc_instrumentalness": instrumentalness,
+        "mfcc_temporal_complexity": temporal_complexity,
+        "mfcc_timbre_smoothness": timbre_smoothness,
+        "mfcc_temporal_variability": temporal_variability,
         "mfcc_smoothness": mf._mfcc_smoothness(normalize=True),
         "mfcc_entropy": mf._mfcc_entropy(normalize=True),
         "mfcc_flux": mf._mfcc_flux(normalize=True),
@@ -493,13 +492,11 @@ def export_mfcc_debug_row(audio_path, sig):
         "mfcc_transient_roughness": mf._mfcc_transient_roughness(width=9, normalize=True, mode="interp"),
         "mfcc_attack_smoothness": mf._mfcc_attack_smoothness(attack_frames=None, normalize=True),
         "mfcc_sustain_stability": mf._mfcc_sustain_stability(attack_frames=None, sustain_frames=None, normalize=True),
-        "spotify_loudness": spotify["loudness"],
-        "spotify_energy": spotify["energy"],
-        "spotify_speechiness": spotify["speechiness"],
-        "spotify_acousticness": spotify["acousticness"],
-        "spotify_valence": spotify["valence"],
-        "spotify_liveness": spotify["liveness"],
-        "spotify_instrumentalness": spotify["instrumentalness"],
+        "spotify_rms_loudness_evidence": spotify["rms_loudness_evidence"],
+        "spotify_timbral_energy_evidence": spotify["timbral_energy_evidence"],
+        "spotify_temporal_complexity": spotify["temporal_complexity"],
+        "spotify_timbre_smoothness": spotify["timbre_smoothness"],
+        "spotify_temporal_variability": spotify["temporal_variability"],
     }
 
     for i in range(len(coeff_mean)):
