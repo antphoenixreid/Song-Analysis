@@ -109,20 +109,18 @@ class ChromagramFeatures():
         return C/S
     
     def _chroma_profile(self, normalize=True, use_db=False):
-        C = self._chroma_db() if use_db else self._chroma()
-
-        self.raw_chroma_energy = np.linalg.norm(C, axis=0)
+        C_linear = self._chroma()
+        self.raw_chroma_energy = np.linalg.norm(C_linear, axis=0)
 
         if normalize:
-            colsum = np.sum(C, axis=0, keepdims=True)
+            colsum = np.sum(C_linear, axis=0, keepdims=True)
             nonzero_mask = colsum > EPS
+            C_norm = np.full_like(C_linear, 1.0/12.0)
+            np.divide(C_linear, colsum, out=C_norm, where=nonzero_mask)
+            return C_norm
 
-            # Mask zero-energy frames to avoid needless division by EPS
-            C_norm = np.full_like(C, 1.0/12.0)
-            np.divide(C, colsum, out=C_norm, where=nonzero_mask)
-            C = C_norm
-        
-        return C
+        # normalize=False: return dB or linear as requested
+        return self._chroma_db() if use_db else C_linear
 
     def _mean_chroma(self, normalize=True, use_db=False):
         key = f"mean_chroma_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}"
@@ -223,12 +221,14 @@ class ChromagramFeatures():
         theta = 2.0*np.pi*np.arange(12)/12.0
         x = np.sum(P*np.cos(theta)[:, None], axis=0)
         y = np.sum(P*np.sin(theta)[:, None], axis=0)
-        mu = np.arctan2(y, x)
+        mu_rad = np.arctan2(y, x)
+        # Map [-π, π] → [0, 2π] → [0, 12)
+        mu_pc = (mu_rad % (2.0 * np.pi)) * (12.0 / (2.0 * np.pi))
 
-        self._cache_chroma[key] = mu
-        return mu
+        self._cache_chroma[key] = mu_pc
+        return mu_pc
     
-    def _chroma_spread(self, normalize=True, use_db=False):
+    def _chroma_angular_spread(self, normalize=True, use_db=False):
         """
         Circular spread of chroma distribution per frame
 
@@ -236,7 +236,7 @@ class ChromagramFeatures():
             mu_t = chroma centroid in radians
             spread_t = sqrt(sum(p_c*(theta_c - mu_t)^2)/sum(p_c)) where theta_c is angle of chroma bin c
         """
-        key = f"chroma_spread_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}"
+        key = f"chroma_angular_spread_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}"
         if key in self._cache_chroma:
             return self._cache_chroma[key]
 
@@ -258,6 +258,10 @@ class ChromagramFeatures():
 
         self._cache_chroma[key] = float(spread)
         return float(spread)
+
+    def _chroma_spread(self, normalize=True, use_db=False):
+        """Deprecated alias for _chroma_angular_spread."""
+        return self._chroma_angular_spread(normalize=normalize, use_db=use_db)
 
     def _chroma_skewness(self, normalize=True, use_db=False):
         """
@@ -374,17 +378,23 @@ class ChromagramFeatures():
         
         result = self._key_estimation(normalize=normalize, use_db=use_db, method=method)
         scores = result["scores"]
-        s_sorted = np.sort(scores)
-        best = float(s_sorted[-1])
-        second = float(s_sorted[-2]) if len(s_sorted) > 1 else 0.0
 
+        s_sorted = np.sort(scores)
+        best   = float(s_sorted[-1])
+        second = float(s_sorted[-2]) if len(s_sorted) > 1 else 0.0
         margin = best - second
-        clarity = margin/(best + EPS)
+
+        mu  = float(np.mean(scores))
+        std = float(np.std(scores)) + EPS
+        z   = (best - mu) / std                           # how many σ above the template mean
+        # Map z from [0, ~6] to [0, 1]; z=3 → 0.5, z=6 → ~1.0
+        clarity = float(safe_clip01(z / 6.0))
 
         result = {
             "tonal_clarity": clarity,
-            "best_score": best,
-            "margin": margin
+            "best_score":    best,
+            "margin":        margin,
+            "z_score":       z
         }
 
         self._cache_chroma[key] = result
@@ -417,29 +427,36 @@ class ChromagramFeatures():
 
         self._cache_chroma[key] = result
         return result
+
+    def _tonal_coherence(self, normalize=True, use_db=False, method="cosine"):
+        """
+        Renamed from _consonance_dissonance.
+        Measures how well the chroma matches tonal templates (not acoustic consonance).
+        """
+        key = f"tonal_coherence_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}_{method}"
+        if key in self._cache_chroma:
+            return self._cache_chroma[key]
+
+        result_clarity = self._tonal_clarity(normalize=normalize, use_db=use_db, method=method)
+        best = result_clarity["best_score"]
+
+        tonal_coherence = safe_clip01(best)
+        tonal_incoherence = float(1.0 - tonal_coherence)
+
+        result = {
+            "tonal_coherence":   tonal_coherence,
+            "tonal_incoherence": tonal_incoherence
+        }
+
+        self._cache_chroma[key] = result
+        return result
     
     def _consonance_dissonance(self, normalize=True, use_db=False, method="cosine"):
         """
         Consonance: average score of the best matching major/minor template
         Dissonance: average score of the non-best templates (1 - consonance)
         """
-        key = f"consonance_dissonance_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}_{method}"
-        if key in self._cache_chroma:
-            return self._cache_chroma[key]
-        
-        result = self._tonal_clarity(normalize=normalize, use_db=use_db, method=method)
-        best = result["best_score"]
-
-        consonance = safe_clip01(best)
-        dissonance = float(1.0 - consonance)
-
-        result = {
-            "consonance": consonance,
-            "dissonance": dissonance
-        }
-
-        self._cache_chroma[key] = result
-        return result
+        return self._tonal_coherence(normalize=normalize, use_db=use_db, method=method)
     
     # Harmonic Features
     def _chord_detection(self, normalize=True, use_db=False, method="cosine"):
@@ -472,7 +489,18 @@ class ChromagramFeatures():
         else:
             raise ValueError("method must be 'cosine' or 'dot'")
         
-        chord_idx = np.argmax(scores, axis=0)
+        chord_idx_raw = np.argmax(scores, axis=0)
+        T = chord_idx_raw.size
+        chord_idx = np.copy(chord_idx_raw)
+
+        window = 2   # ±2 frames (~200ms at H=512, sr=22050)
+        for t in range(T):
+            lo = max(0, t - window)
+            hi = min(T, t + window + 1)
+            segment = chord_idx_raw[lo:hi]
+            # Majority vote: pick the most frequent chord in the window
+            counts = np.bincount(segment, minlength=scores.shape[0])
+            chord_idx[t] = int(np.argmax(counts))
         best_scores = scores[chord_idx, np.arange(scores.shape[1])]
         chord_labels = [labels[i] for i in chord_idx]
 
@@ -873,9 +901,10 @@ class ChromagramFeatures():
 
         self._cache_chroma[key] = val
         return val
-    
-    def _chroma_flux_variance(self, normalize=True, use_db=False):
-        key = f"chroma_flux_variance_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}"
+
+    def _chroma_flux_std(self, normalize=True, use_db=False):
+        """Standard deviation of per-frame chroma flux (same scale as flux mean)."""
+        key = f"chroma_flux_std_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}"
         if key in self._cache_chroma:
             return self._cache_chroma[key]
 
@@ -885,13 +914,23 @@ class ChromagramFeatures():
             return 0.0
 
         d = np.linalg.norm(np.diff(P, axis=1), axis=0)
-        val = float(np.var(d))
+        val = float(np.std(d))
 
         self._cache_chroma[key] = val
         return val
+    
+    def _chroma_flux_variance(self, normalize=True, use_db=False):
+        std = self._chroma_flux_std(normalize=normalize, use_db=False)
+        return std**2
 
-    def _harmonic_template_fit(self, normalize=True, use_db=False, method="cosine"):
-        key = f"harmonic_template_fit_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}_{method}"
+    def _tonal_template_similarity(self, normalize=True, use_db=False, method="cosine"):
+        """
+        Renamed from _harmonic_template_fit.
+        Measures how well the mean chroma matches the best key template,
+        reported as a margin (best minus second-best) and z-score to remove
+        the upward bias of taking the maximum over 24 candidates.
+        """
+        key = f"tonal_template_similarity_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}_{method}"
         if key in self._cache_chroma:
             return self._cache_chroma[key]
 
@@ -899,23 +938,42 @@ class ChromagramFeatures():
         T = self._chroma_template()
 
         if method == "cosine":
-            Pn = P/(np.linalg.norm(P) + EPS)
-            Tn = T/(np.linalg.norm(T, axis=1, keepdims=True) + EPS)
+            Pn = P / (np.linalg.norm(P) + EPS)
+            Tn = T / (np.linalg.norm(T, axis=1, keepdims=True) + EPS)
             scores = Tn @ Pn
         elif method == "dot":
             scores = T @ P
         else:
             raise ValueError("method must be 'cosine' or 'dot'")
 
-        best = float(np.max(scores)) if scores.size else 0.0
+        if scores.size == 0:
+            result = {"best_score": 0.0, "margin": 0.0, "z_score": 0.0,
+                    "scores": scores, "best_idx": 0}
+            self._cache_chroma[key] = result
+            return result
+
+        s_sorted = np.sort(scores)[::-1]
+        best   = float(s_sorted[0])
+        second = float(s_sorted[1]) if s_sorted.size > 1 else 0.0
+        margin = float(best - second)                        # how far above runner-up
+
+        mu  = float(np.mean(scores))
+        std = float(np.std(scores)) + EPS
+        z_score = float((best - mu) / std)                  # how many σ above average
+
         result = {
             "best_score": best,
-            "scores": scores,
-            "best_idx": int(np.argmax(scores)) if scores.size else 0
+            "margin":     margin,
+            "z_score":    z_score,
+            "scores":     scores,
+            "best_idx":   int(np.argmax(scores))
         }
 
         self._cache_chroma[key] = result
         return result
+
+    def _harmonic_template_fit(self, normalize=True, use_db=False, method="cosine"):
+        return self._tonal_template_similarity(normalize=normalize, use_db=use_db, method=method)
 
     def _tonal_stability(self, normalize=True, use_db=False):
         key = f"tonal_stability_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}"
@@ -935,13 +993,29 @@ class ChromagramFeatures():
         if key in self._cache_chroma:
             return self._cache_chroma[key]
 
-        ac = self._chroma_autocorrelation(lag_max=64,normalize=normalize, use_db=use_db)["acf_mean"]
-        if ac.size < 2:
+        ac = self._chroma_autocorrelation(lag_max=64, normalize=normalize, use_db=use_db)["acf_mean"]
+
+        # Minimum lag: skip the first ~1 second of lags (sr/H frames ≈ 43 frames at
+        # 22050/512). Use a fixed minimum of 8 lags (~186ms) to avoid trivial matches.
+        min_lag = max(8, int(round(self.sr / (self.H * 4.0))))
+        if ac.size <= min_lag:
             self._cache_chroma[key] = 0.0
             return 0.0
-        
-        region = ac[1:]
-        val = float(np.clip(np.max(region), 0.0, 1.0)) if region.size else 0.0
+
+        region = ac[min_lag:]
+
+        # Use peak prominence instead of raw max so isolated spikes don't dominate
+        if region.size < 3:
+            val = float(np.clip(np.max(region), 0.0, 1.0))
+        else:
+            from scipy.signal import find_peaks
+            peaks, props = find_peaks(region, prominence=0.05)
+            if peaks.size > 0:
+                # Best prominent peak normalised to [0,1]
+                val = float(np.clip(np.max(props["prominences"]), 0.0, 1.0))
+            else:
+                # No prominent peaks — mild background repetition
+                val = float(np.clip(np.max(region) * 0.5, 0.0, 1.0))
 
         self._cache_chroma[key] = val
         return val
@@ -956,265 +1030,380 @@ class ChromagramFeatures():
             self._cache_chroma[key] = 0.0
             return 0.0
 
-        p = P/(np.sum(P) + EPS)
-        val = float(np.clip(np.max(p)/(np.mean(p) + EPS), 0.0, 12.0)/12.0)
+        p = P / (np.sum(P) + EPS)
+        val = float(np.clip(np.max(p), 0.0, 1.0))
 
         self._cache_chroma[key] = val
         return val
     
     def _key_estimation(self, normalize=True, use_db=False, method="correlation"):
         """
-        Estimate the key of the audio signal
-        Returns:
-            key_idx: index of estimated key in template_labels (0-23)
-            tonic: pitch class of tonic (0-11)
-            mode: "maj" or "min"
-            score: cosine similarity score of best matching template
-            scores: array of cosine similarity scores for all templates
+        Estimate tonic and mode from the mean chromagram.
+
+        This is the primary tonal estimator for the feature pipeline.  The
+        returned ``key_tonic`` is always a pitch class in [0, 11]; mode is
+        represented separately.  ``key_idx`` is retained only as a legacy
+        0--23 template index.
         """
         key = f"key_estimation_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}_{method}"
         if key in self._cache_chroma:
             return self._cache_chroma[key]
-        
-        P = self._mean_chroma(normalize=normalize, use_db=use_db)
 
-        # Mean-center the track chromagram
+        P = np.asarray(self._mean_chroma(normalize=normalize, use_db=use_db), dtype=float)
+        if P.size == 0 or not np.any(np.isfinite(P)):
+            result = {
+                "key_idx": None,
+                "key_tonic": None,
+                "tonic": None,
+                "mode": None,
+                "mode_value": None,
+                "score": 0.0,
+                "scores": np.zeros(24, dtype=float),
+                "score_major": 0.0,
+                "score_minor": 0.0,
+                "delta_score": 0.0,
+                "margin": 0.0,
+                "confidence": 0.0,
+            }
+            self._cache_chroma[key] = result
+            return result
+
+        # Mean-center the observed profile to match the centered templates.
         P_centered = P - np.mean(P)
-        P_norm = P_centered/(np.linalg.norm(P_centered) + EPS)
+        norm = float(np.linalg.norm(P_centered))
+        if norm <= EPS:
+            result = {
+                "key_idx": None,
+                "key_tonic": None,
+                "tonic": None,
+                "mode": None,
+                "mode_value": None,
+                "score": 0.0,
+                "scores": np.zeros(24, dtype=float),
+                "score_major": 0.0,
+                "score_minor": 0.0,
+                "delta_score": 0.0,
+                "margin": 0.0,
+                "confidence": 0.0,
+            }
+            self._cache_chroma[key] = result
+            return result
 
-        # Pearson Correlation against all 24 centered major/minor profiles
-        scores = KEY_TEMPLATES_NORM @ P_norm
+        P_norm = P_centered / norm
+        scores = np.asarray(KEY_TEMPLATES_NORM @ P_norm, dtype=float)
 
+        # Best template identifies both tonic and mode.
         key_idx = int(np.argmax(scores))
-        tonic = key_idx%12
+        tonic = key_idx % 12
         mode = "major" if key_idx < 12 else "minor"
+        mode_value = 1 if mode == "major" else 0
         score = float(scores[key_idx])
-
-        # Extract relative major vs minor confidence for the best tonic
-        score_major = float(scores[tonic])
-        score_minor = float(scores[tonic + 12])
-
-        result = {
-            "key_idx": key_idx,
-            "tonic": tonic,
-            "mode": mode,
-            "score": score,
-            "scores": scores,
-            "score_major": score_major,
-            "score_minor": score_minor,
-            "delta_score": float(score_major - score_minor)
-        }
-
-        self._cache_chroma[key] = result
-        return result
-    
-    def _energy_chroma(self, normalize=True, use_db=False):
-        key = f"energy_chroma_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}"
-        if key in self._cache_chroma:
-            return self._cache_chroma[key]
-
-        # 1. Measure raw acoustic magnitude energy before L1 profile normalization
-        C = self._chroma_db() if use_db else self._chroma()
-
-        # Compute RMS energy across chroma bins and temporal frames
-        if C.size == 0:
-            raw_magnitude_energy = 0.0
-        else:
-            frame_norms = np.linalg.norm(C, axis=0) # L2 norm per frame
-            raw_magnitude_energy = float(np.mean(frame_norms))
-
-        # Robust log-scale normalization: log1p compresses large values,
-        # /8.0 puts typical chroma energies (exp(8) ≈ 3000 linear) in [0,1]
-        norm_energy = safe_clip01(np.log1p(raw_magnitude_energy) / 8.0)
-
-        # 2. Compute tonal structural components
-        fit_res = self._harmonic_template_fit(normalize=normalize, use_db=use_db, method="dot")
-        fit = fit_res["best_score"] if isinstance(fit_res, dict) else float(fit_res)
-
-        spread = self._chroma_spread(normalize=normalize, use_db=use_db)
-        stability = self._tonal_stability(normalize=normalize, use_db=use_db)
-
-        MAX_CHROMA_SPREAD = np.pi # Max angular distance on circle
-        norm_spread = np.mean(spread)/MAX_CHROMA_SPREAD
-        spread_compactness = safe_clip01(1.0 - norm_spread)
-
-        # 3. Fuse unnormalized magnitude energy with tonal focus/stability
-        val = safe_clip01(
-            0.50*norm_energy +
-            0.20*fit +
-            0.15*stability +
-            0.15*spread_compactness
-        )
-
-        self._cache_chroma[key] = val
-        return val
-
-    def _speechiness_chroma(self, normalize=True, use_db=False):
-        key = f"speechiness_chroma_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}"
-        if key in self._cache_chroma:
-            return self._cache_chroma[key]
-
-        ent = self._chroma_entropy(normalize=normalize, use_db=use_db)
-        flux = self._chroma_flux_mean(normalize=normalize, use_db=use_db)
-        var = self._chroma_flux_variance(normalize=normalize, use_db=use_db)
-        repetitive = self._chroma_repetition(normalize=normalize, use_db=use_db)
-        energy = self._energy_chroma(normalize=normalize, use_db=use_db)
-
-        val = safe_clip01(0.35*ent + 0.25*np.tanh(flux) + 0.20*np.tanh(var) + 0.10*(1.0 - repetitive) + 0.10*(1.0 - energy))
-
-        self._cache_chroma[key] = val
-        return val
-
-    def _acousticness_chroma(self, normalize=True, use_db=False):
-        key = f"acousticness_chroma_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}"
-        if key in self._cache_chroma:
-            return self._cache_chroma[key]
-
-        fit = self._harmonic_template_fit(normalize=normalize, use_db=use_db, method="dot")["best_score"]
-        stability = self._tonal_stability(normalize=normalize, use_db=use_db)
-        entropy = self._chroma_entropy(normalize=normalize, use_db=use_db)
-        flux = self._chroma_flux_mean(normalize=normalize, use_db=use_db)
-        energy = self._energy_chroma(normalize=normalize, use_db=use_db)
-
-        val = safe_clip01(0.30*fit + 0.25*stability + 0.20*(1.0 - entropy) + 0.15*(1.0 - np.tanh(flux)) + 0.10*(1.0 - energy))
-
-        self._cache_chroma[key] = val
-        return val
-    
-    def _danceability_chroma(self, normalize=True, use_db=False):
-        key = f"danceability_chroma_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}"
-        if key in self._cache_chroma:
-            return self._cache_chroma[key]
-
-        rep = self._chroma_repetition(normalize=normalize, use_db=use_db)
-        smooth = self._chroma_smoothness(normalize=normalize, use_db=use_db, metric="l2")["smoothness"]
-        stability = self._tonal_stability(normalize=normalize, use_db=use_db)
-        flux = self._chroma_flux_mean(normalize=normalize, use_db=use_db)
-        energy = self._energy_chroma(normalize=normalize, use_db=use_db)
-
-        val = safe_clip01(0.30*rep + 0.20*smooth + 0.20*stability + 0.15*(1.0 - np.tanh(flux)) + 0.15*energy)
-
-        self._cache_chroma[key] = val
-        return val
-    
-    def _valence_chroma(self, normalize=True, use_db=False):
-        key = f"valence_chroma_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}"
-        if key in self._cache_chroma:
-            return self._cache_chroma[key]
-        
-        prof = self._mean_chroma_profile(normalize=normalize, use_db=use_db)
-        if prof.size == 0:
-            self._cache_chroma[key] = 0.5
-            return 0.5
-        
-        major_template = np.array([
-            [1, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0]
-        ])
-        major = self._mode_classification(normalize=normalize, use_db=use_db, method="cosine")["mode"] == "maj"
-        key_res = self._key_estimation(normalize=normalize, use_db=use_db, method="cosine")
-        tonic = key_res["tonic"]
-        templates = self._chroma_template()
-        maj_score = float(key_res["scores"][tonic])
-        min_score = float(key_res["scores"][tonic + 12])
-        clarity = self._tonal_clarity(normalize=normalize, use_db=use_db, method="cosine")["tonal_clarity"]
-        fit = self._harmonic_template_fit(normalize=normalize, use_db=use_db, method="cosine")["best_score"]
-        bright = float((prof[tonic % 12] + prof[(tonic + 4)%12] + prof[(tonic + 7)%12] + prof[(tonic + 11)%12]) / (np.sum(prof) + EPS))
-        delta = maj_score - min_score
-
-        val = safe_clip01(0.40*(0.5 + 0.5*np.tanh(delta)) + 0.25*clarity + 0.20*fit + 0.15*bright)
-
-        self._cache_chroma[key] = val
-        return val
-    
-    def _tempo_chroma(self, normalize=True, use_db=False):
-        key = f"tempo_chroma_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}"
-        if key in self._cache_chroma:
-            return self._cache_chroma[key]
-        
-        rep = self._chroma_repetition(normalize=normalize, use_db=use_db)
-        flux = self._chroma_flux_mean(normalize=normalize, use_db=use_db)
-        var = self._chroma_flux_variance(normalize=normalize, use_db=use_db)
-
-        tempo_proxy = float(np.clip(40.0 + 200.0*(0.45*rep + 0.35*np.tanh(flux) + 0.20*np.tanh(var)), 40.0, 240.0))
-
-        self._cache_chroma[key] = tempo_proxy
-        return tempo_proxy
-    
-    def _instrumentalness_chroma(self, normalize=True, use_db=False):
-        key = f"instrumentalness_chroma_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}"
-        if key in self._cache_chroma:
-            return self._cache_chroma[key]
-
-        fit = self._harmonic_template_fit(normalize=normalize, use_db=use_db, method="dot")["best_score"]
-        stability = self._tonal_stability(normalize=normalize, use_db=use_db)
-        entropy = self._chroma_entropy(normalize=normalize, use_db=use_db)
-        tonal_focus = self._pitch_class_peakedness(normalize=normalize, use_db=use_db)
-        energy = self._energy_chroma(normalize=normalize, use_db=use_db)
-
-        val = safe_clip01(0.30*fit + 0.25*stability + 0.20*tonal_focus + 0.15*(1.0 - entropy) + 0.10*energy)
-
-        self._cache_chroma[key] = val
-        return val
-
-    def _time_signature_chroma(self, normalize=True, use_db=False):
-        key = f"time_signature_chroma_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}"
-        if key in self._cache_chroma:
-            return self._cache_chroma[key]
-
-        rep = self._chroma_repetition(normalize=normalize, use_db=use_db)
-        flux = self._chroma_flux_mean(normalize=normalize, use_db=use_db)
-        smooth = self._chroma_smoothness(normalize=normalize, use_db=use_db, metric="l2")["smoothness"]
-
-        meter_score = safe_clip01(0.5*rep + 0.3*smooth + 0.2*(1.0 - np.tanh(flux)))
-        ts = 3 if meter_score > 0.55 else 4
-
-        self._cache_chroma[key] = ts
-        return ts
-
-    def _mode_classification(self, normalize=True, use_db=False, method="cosine"):
-        """
-        Classify the mode (major vs minor) of the audio signal
-        Returns:
-            mode string: "maj" or "min"
-            score_major: float score for best matching major template
-            score_minor: float score for best matching minor template
-            delta_score: score_major - score_minor, higher = more major-like, lower = more minor-like
-        """
-        key = f"mode_classification_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}_{method}"
-        if key in self._cache_chroma:
-            return self._cache_chroma[key]
-        
-        key_res = self._key_estimation(normalize=normalize, use_db=use_db, method=method)
-        tonic = key_res["tonic"]
-        scores = key_res["scores"]
 
         score_major = float(scores[tonic])
         score_minor = float(scores[tonic + 12])
         delta_score = score_major - score_minor
 
+        # Confidence is based on both absolute template fit and separation from
+        # the runner-up.  It is evidence strength, not a calibrated probability.
+        ranked = np.sort(scores)[::-1]
+        second_score = float(ranked[1]) if ranked.size > 1 else score
+        margin = max(0.0, score - second_score)
+        score_strength = safe_clip01((score + 1.0) / 2.0)
+        margin_strength = safe_clip01(margin / 0.15)
+        confidence = safe_clip01(0.60 * score_strength + 0.40 * margin_strength)
+
         result = {
-            "mode": key_res["mode"],
+            "key_idx": key_idx,
+            "key_tonic": tonic,
+            "tonic": tonic,
+            "mode": mode,
+            "mode_value": mode_value,
+            "score": score,
+            "scores": scores,
             "score_major": score_major,
             "score_minor": score_minor,
-            "delta_score": delta_score
+            "delta_score": float(delta_score),
+            "margin": float(margin),
+            "confidence": float(confidence),
         }
 
         self._cache_chroma[key] = result
         return result
-    
-    def spotify_audio_features(self, normalize=True, use_db=False, method="cosine"):
-        key_res = self._key_estimation(normalize=normalize, use_db=use_db, method=method)
-        mode_res = self._mode_classification(normalize=normalize, use_db=use_db, method=method)
+
+    def _energy_chroma(self, normalize=True, use_db=False):
+        """Return tonal-energy evidence, not a replacement for acoustic energy."""
+        key = f"tonal_energy_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}"
+        if key in self._cache_chroma:
+            return self._cache_chroma[key]
+
+        C = self._chroma_db() if use_db else self._chroma()
+        if C.size == 0:
+            self._cache_chroma[key] = 0.0
+            return 0.0
+
+        frame_norms = np.linalg.norm(C, axis=0)
+        raw_magnitude_energy = float(np.mean(frame_norms))
+        norm_energy = safe_clip01(np.log1p(max(raw_magnitude_energy, 0.0)) / 8.0)
+
+        fit_res = self._tonal_template_similarity(
+            normalize=normalize, use_db=use_db, method="dot"
+        )
+        fit = safe_clip01(float(fit_res.get("best_score", 0.0)) / 5.0)
+
+        spread = np.asarray(
+            self._chroma_angular_spread(normalize=normalize, use_db=use_db),
+            dtype=float,
+        )
+        spread_value = float(np.mean(spread)) if spread.size else np.pi
+        spread_compactness = safe_clip01(1.0 - spread_value / np.pi)
+        stability = safe_clip01(
+            float(self._tonal_stability(normalize=normalize, use_db=use_db))
+        )
+
+        val = safe_clip01(
+            0.50 * norm_energy +
+            0.20 * fit +
+            0.15 * stability +
+            0.15 * spread_compactness
+        )
+        self._cache_chroma[key] = val
+        return val
+
+    def _tonal_energy_evidence(self, normalize=True, use_db=False):
+        return self._energy_chroma(normalize=normalize, use_db=use_db)
+
+    def _speechiness_chroma(self, normalize=True, use_db=False):
+        """Return inverse tonal-coherence evidence; never use as primary speechiness."""
+        key = f"speech_band_tonal_evidence_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}"
+        if key in self._cache_chroma:
+            return self._cache_chroma[key]
+
+        coherence = float(
+            self._tonal_coherence(normalize=normalize, use_db=use_db)["tonal_coherence"]
+        )
+        val = safe_clip01(1.0 - coherence)
+        self._cache_chroma[key] = val
+        return val
+
+    def _speech_tonal_evidence(self, normalize=True, use_db=False):
+        return self._speechiness_chroma(normalize=normalize, use_db=use_db)
+
+    def _acousticness_chroma(self, normalize=True, use_db=False):
+        """Return tonal smoothness evidence; frequency/MFCC should own acousticness."""
+        key = f"tonal_smoothness_evidence_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}"
+        if key in self._cache_chroma:
+            return self._cache_chroma[key]
+
+        fit = self._tonal_template_similarity(
+            normalize=normalize, use_db=use_db, method="dot"
+        )["best_score"]
+        fit = safe_clip01(float(fit) / 5.0)
+        stability = safe_clip01(
+            float(self._tonal_stability(normalize=normalize, use_db=use_db))
+        )
+        entropy = safe_clip01(
+            float(self._chroma_entropy(normalize=normalize, use_db=use_db))
+        )
+        flux = max(0.0, float(self._chroma_flux_mean(normalize=normalize, use_db=use_db)))
+        energy = self._tonal_energy_evidence(normalize=normalize, use_db=use_db)
+
+        val = safe_clip01(
+            0.30 * fit +
+            0.25 * stability +
+            0.20 * (1.0 - entropy) +
+            0.15 * (1.0 - np.tanh(flux)) +
+            0.10 * (1.0 - energy)
+        )
+        self._cache_chroma[key] = val
+        return val
+
+    def _tonal_smoothness_evidence(self, normalize=True, use_db=False):
+        return self._acousticness_chroma(normalize=normalize, use_db=use_db)
+
+    def _harmonic_repetitiveness(self, normalize=True, use_db=False):
+        """Measure harmonic repetition and tonal stability, not danceability."""
+        key = f"harmonic_repetitiveness_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}"
+        if key in self._cache_chroma:
+            return self._cache_chroma[key]
+
+        rep = safe_clip01(float(self._chroma_repetition(normalize=normalize, use_db=use_db)))
+        spread = np.asarray(
+            self._chroma_angular_spread(normalize=normalize, use_db=use_db),
+            dtype=float,
+        )
+        smooth = safe_clip01(
+            1.0 - (float(np.mean(spread)) if spread.size else np.pi) / np.pi
+        )
+        stability = safe_clip01(
+            float(self._tonal_stability(normalize=normalize, use_db=use_db))
+        )
+        flux = max(0.0, float(self._chroma_flux_mean(normalize=normalize, use_db=use_db)))
+        energy = self._tonal_energy_evidence(normalize=normalize, use_db=use_db)
+
+        val = safe_clip01(
+            0.30 * rep +
+            0.20 * smooth +
+            0.20 * stability +
+            0.15 * (1.0 - np.tanh(flux)) +
+            0.15 * energy
+        )
+        self._cache_chroma[key] = val
+        return val
+
+    def _danceability_chroma(self, normalize=True, use_db=False):
+        """Deprecated compatibility alias for harmonic repetition evidence."""
+        return self._harmonic_repetitiveness(normalize=normalize, use_db=use_db)
+
+    def _valence_chroma(self, normalize=True, use_db=False):
+        """Return a chroma-based harmonic-valence proxy, not Spotify valence."""
+        key = f"harmonic_valence_proxy_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}"
+        if key in self._cache_chroma:
+            return self._cache_chroma[key]
+
+        prof = np.asarray(
+            self._mean_chroma_profile(normalize=normalize, use_db=use_db),
+            dtype=float,
+        )
+        key_res = self._key_estimation(
+            normalize=normalize, use_db=use_db, method="cosine"
+        )
+        if prof.size == 0 or key_res["tonic"] is None:
+            self._cache_chroma[key] = 0.5
+            return 0.5
+
+        tonic = int(key_res["tonic"])
+        maj_score = float(key_res["score_major"])
+        min_score = float(key_res["score_minor"])
+        delta = maj_score - min_score
+        clarity = safe_clip01(
+            float(self._tonal_clarity(
+                normalize=normalize, use_db=use_db, method="cosine"
+            )["tonal_clarity"])
+        )
+        fit = safe_clip01(
+            float(self._tonal_template_similarity(
+                normalize=normalize, use_db=use_db, method="cosine"
+            )["best_score"]) / 5.0
+        )
+
+        p = prof / (np.sum(prof) + EPS)
+        fifth = (tonic + 7) % 12
+        major_third = (tonic + 4) % 12
+        leading = (tonic + 11) % 12
+        brightness = float(p[tonic] + p[major_third] + p[fifth] + p[leading])
+        brightness = safe_clip01(brightness)
+
+        val = safe_clip01(
+            0.40 * (0.5 + 0.5 * np.tanh(delta)) +
+            0.25 * clarity +
+            0.20 * fit +
+            0.15 * brightness
+        )
+        self._cache_chroma[key] = val
+        return val
+
+    def _harmonic_valence_proxy(self, normalize=True, use_db=False):
+        return self._valence_chroma(normalize=normalize, use_db=use_db)
+
+    def _tempo_chroma(self, normalize=True, use_db=False):
+        """Deprecated: chroma cannot provide a defensible BPM estimate."""
+        import logging
+        logging.getLogger(__name__).warning(
+            "_tempo_chroma() is deprecated and returns None. "
+            "Use TempogramFeatures for tempo estimation."
+        )
+        return None
+
+    def _instrumentalness_chroma(self, normalize=True, use_db=False):
+        """Return tonal-focus evidence only; chroma does not detect vocals."""
+        key = f"tonal_focus_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}"
+        if key in self._cache_chroma:
+            return self._cache_chroma[key]
+        val = self._pitch_class_peakedness(normalize=normalize, use_db=use_db)
+        self._cache_chroma[key] = val
+        return val
+
+    def _tonal_focus_evidence(self, normalize=True, use_db=False):
+        return self._instrumentalness_chroma(normalize=normalize, use_db=use_db)
+
+    def _time_signature_chroma(self, normalize=True, use_db=False):
+        """Deprecated: chroma contains no reliable meter evidence."""
+        import logging
+        logging.getLogger(__name__).warning(
+            "_time_signature_chroma() is deprecated and returns None. "
+            "Use TempogramFeatures for meter estimation."
+        )
+        return None
+
+    def _mode_classification(self, normalize=True, use_db=False, method="cosine"):
+        """Return mode and mode evidence derived from the primary key estimate."""
+        key = f"mode_classification_{'norm' if normalize else 'raw'}_{'db' if use_db else 'lin'}_{method}"
+        if key in self._cache_chroma:
+            return self._cache_chroma[key]
+
+        key_res = self._key_estimation(
+            normalize=normalize, use_db=use_db, method=method
+        )
+        result = {
+            "mode": key_res["mode"],
+            "mode_value": key_res["mode_value"],
+            "score_major": float(key_res["score_major"]),
+            "score_minor": float(key_res["score_minor"]),
+            "delta_score": float(key_res["delta_score"]),
+            "confidence": float(key_res["confidence"]),
+        }
+        self._cache_chroma[key] = result
+        return result
+
+    def chroma_domain_evidence(self, normalize=True, use_db=False, method="cosine"):
+        """
+        Return chroma-domain evidence for central fusion.
+
+        Chroma owns tonic/mode estimation.  Tempo and meter are intentionally
+        omitted because they belong to the tempogram/rhythm domain.  The other
+        outputs are explicitly supporting evidence rather than direct Spotify
+        feature estimates.
+        """
+        key_res = self._key_estimation(
+            normalize=normalize, use_db=use_db, method=method
+        )
+        mode_res = self._mode_classification(
+            normalize=normalize, use_db=use_db, method=method
+        )
 
         return {
-            "energy": self._energy_chroma(normalize=normalize, use_db=use_db),
-            "speechiness": self._speechiness_chroma(normalize=normalize, use_db=use_db),
-            "acousticness": self._acousticness_chroma(normalize=normalize, use_db=use_db),
-            "danceability": self._danceability_chroma(normalize=normalize, use_db=use_db),
-            "valence": self._valence_chroma(normalize=normalize, use_db=use_db),
-            "tempo": self._tempo_chroma(normalize=normalize, use_db=use_db),
-            "instrumentalness": self._instrumentalness_chroma(normalize=normalize, use_db=use_db),
-            "key": key_res["key_idx"],
+            "tonal_energy_evidence": self._tonal_energy_evidence(
+                normalize=normalize, use_db=use_db
+            ),
+            "speech_tonal_evidence": self._speech_tonal_evidence(
+                normalize=normalize, use_db=use_db
+            ),
+            "tonal_smoothness_evidence": self._tonal_smoothness_evidence(
+                normalize=normalize, use_db=use_db
+            ),
+            "harmonic_repetitiveness": self._harmonic_repetitiveness(
+                normalize=normalize, use_db=use_db
+            ),
+            "harmonic_valence_proxy": self._harmonic_valence_proxy(
+                normalize=normalize, use_db=use_db
+            ),
+            "tonal_focus_evidence": self._tonal_focus_evidence(
+                normalize=normalize, use_db=use_db
+            ),
+            "key_tonic": key_res["key_tonic"],
+            "key_confidence": float(key_res["confidence"]),
+            "key_score": float(key_res["score"]),
+            "key_margin": float(key_res["margin"]),
             "mode": mode_res["mode"],
-            "time_signature": self._time_signature_chroma(normalize=normalize, use_db=use_db),
+            "mode_value": mode_res["mode_value"],
+            "mode_confidence": float(mode_res["confidence"]),
+            "score_major": float(mode_res["score_major"]),
+            "score_minor": float(mode_res["score_minor"]),
+            "mode_delta": float(mode_res["delta_score"]),
         }
+
+    def spotify_audio_features(self, normalize=True, use_db=False, method="cosine"):
+        """Backward-compatible alias for :meth:`chroma_domain_evidence`."""
+        return self.chroma_domain_evidence(
+            normalize=normalize, use_db=use_db, method=method
+        )

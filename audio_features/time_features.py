@@ -5,8 +5,7 @@ Time domain audio features.
 import numpy as np
 import librosa
 from scipy.signal import find_peaks
-from scipy.ndimage import maximum_filter
-from .utils import EPS, safe_clip01, safe_median
+from .utils import EPS, safe_clip01
 from audio_features.audio_signal import AudioSignal
 
 
@@ -26,12 +25,9 @@ class TimeFeatures():
         #     self.invalid = True
         #     return
 
-        # pad short audio
-        if len(self.y) < self.N:
-            pad = self.N - len(self.y)
-            self.y = np.pad(self.y, (0, pad), mode="constant")
-
-        # precompute frequencies
+        # Keep the original signal length intact. Frame-based methods below
+        # apply their own padding, so duration-based statistics remain correct
+        # for recordings shorter than one analysis window.
         self._fft_freqs = librosa.fft_frequencies(sr=self.sr, n_fft=self.N)
 
     def _global_loudness_dB(self) -> float:
@@ -165,8 +161,20 @@ class TimeFeatures():
 
         onset_env = np.asarray(onset_env, dtype=float).ravel()
 
-        frame_rate = self.sr/float(self.H)
-        times = np.arange(len(onset_env))/frame_rate
+        frame_rate = self.sr / float(self.H)
+        if center:
+            times = librosa.frames_to_time(
+                np.arange(len(onset_env)),
+                sr=self.sr,
+                hop_length=self.H,
+                n_fft=self.N,
+            )
+        else:
+            times = librosa.frames_to_time(
+                np.arange(len(onset_env)),
+                sr=self.sr,
+                hop_length=self.H,
+            )
 
         result = {
             'onset_env': onset_env,
@@ -345,26 +353,31 @@ class TimeFeatures():
         self._cache_time[key] = avg_slope
         return avg_slope
     
-    def _energy_variance(self) -> float:
-        key = "energy_variance"
+    def _energy_iqr_ratio(self) -> float:
+        """Robust relative dispersion of active RMS energy (IQR / median)."""
+        key = "energy_iqr_ratio"
         if key in self._cache_time:
             return self._cache_time[key]
-        
+
         rms_env = self._rms_envelope()
         mask = self._active_rms_mask(db_threshold=-60.0)
-        active = rms_env[mask]
+        n = min(rms_env.size, mask.size)
+        active = rms_env[:n][mask[:n]]
 
         if active.size < 2:
             self._cache_time[key] = 0.0
             return 0.0
-        
-        q75, q25 = np.percentile(active, [75 ,25])
+
+        q25, q75 = np.percentile(active, [25, 75])
         iqr = q75 - q25
+        ratio = float(iqr / (np.median(active) + EPS))
 
-        var = float(iqr/(np.median(active) + EPS))
+        self._cache_time[key] = ratio
+        return ratio
 
-        self._cache_time[key] = var
-        return var
+    def _energy_variance(self) -> float:
+        """Backward-compatible alias; returns IQR/median, not statistical variance."""
+        return self._energy_iqr_ratio()
     
     def _energy_modulation_rate(self, db_threshold: float = -60.0) -> float:
         key = f"energy_mod_rate_{db_threshold}"
@@ -418,103 +431,98 @@ class TimeFeatures():
         self._cache_time[key] = zcr
         return zcr
     
-    def _zcr_variance(self) -> float:
-        key = "zcr_variance"
+    def _zcr_iqr_ratio(self) -> float:
+        """Robust relative dispersion of active-frame ZCR (IQR / median)."""
+        key = "zcr_iqr_ratio"
         if key in self._cache_time:
             return self._cache_time[key]
-        
+
         zcr = self._zero_crossing_rate()
         mask = self._active_rms_mask(db_threshold=-60.0)
-        active_zcr = zcr[mask]
+        n = min(zcr.size, mask.size)
+        active_zcr = zcr[:n][mask[:n]]
 
         if active_zcr.size < 2:
             self._cache_time[key] = 0.0
             return 0.0
-        
-        q75, q25 = np.percentile(active_zcr, [75 ,25])
+
+        q25, q75 = np.percentile(active_zcr, [25, 75])
         iqr = q75 - q25
+        ratio = float(iqr / (np.median(active_zcr) + EPS))
 
-        var = float(iqr/(np.median(active_zcr) + EPS))
+        self._cache_time[key] = ratio
+        return ratio
 
-        self._cache_time[key] = var
-        return var
+    def _zcr_variance(self) -> float:
+        """Backward-compatible alias; returns IQR/median, not statistical variance."""
+        return self._zcr_iqr_ratio()
     
-    def _voiced_ratio(self, db_threshold: float = -60.0) -> float:
-        key = f"voiced_ratio_{db_threshold}"
+    def _harmonic_ratio(self, db_threshold: float = -60.0) -> float:
+        """
+        Estimate the fraction of active frames with strong periodicity in a
+        human-voice-like pitch range. This is a *harmonicity* measure, not a
+        vocal detector; pitched instruments can also score highly.
+        """
+        key = f"harmonic_ratio_{db_threshold}"
         if key in self._cache_time:
             return self._cache_time[key]
-        
+
         zcr = self._zero_crossing_rate()
         mask = self._active_rms_mask(db_threshold=db_threshold)
-
         n = min(len(zcr), len(mask))
-        if n < 2 or mask.sum() < 2:
+        if n < 2 or np.sum(mask[:n]) < 2:
             self._cache_time[key] = 0.0
             return 0.0
-        
-        zcr = zcr[:n]
+
         mask = mask[:n]
 
-        num_frames = n
-        ac_peaks = np.zeros(num_frames, dtype=float)
-
+        # Approximate human vocal fundamental range. This is deliberately kept
+        # as periodicity evidence only; frequency/MFCC domains should establish
+        # actual vocal presence during final fusion.
         f_min = 50.0
         f_max = 400.0
+        min_lag = max(int(self.sr / f_max), 2)
+        max_lag = int(self.sr / f_min)
 
-        # Convert to lag range
-        min_lag = int(self.sr/f_max) # smallest lag (highest pitch)
-        max_lag = int(self.sr/f_min) # largest lag (lowest pitch)
-        min_lag = max(min_lag, 2)
+        y_padded = np.pad(self.y, int(self.N // 2), mode="reflect")
+        frames = librosa.util.frame(
+            y_padded, frame_length=self.N, hop_length=self.H
+        )
 
-        # Use framed signal for efficiency (pad to match other routines)
-        y_padded = np.pad(self.y, int(self.N//2), mode='reflect')
-        frames = librosa.util.frame(y_padded, frame_length=self.N, hop_length=self.H)
-
-        # frames shape (N, num_frames_available)
-        num_avail = min(frames.shape[1], num_frames)
+        num_avail = min(frames.shape[1], n)
+        harmonic = np.zeros(n, dtype=bool)
 
         for i in range(num_avail):
             if not mask[i]:
                 continue
 
-            frame = frames[:, i]
-
+            frame = frames[:, i].astype(float)
+            frame -= np.mean(frame)
             if frame.size < 3:
                 continue
 
-            frame_zm = frame - np.mean(frame)
-            ac_full = np.correlate(frame_zm, frame_zm, mode='full')
-            ac = ac_full[len(ac_full)//2:]
-
-            if ac[0] <= EPS:
-                ac_peaks[i] = 0.0
+            ac = np.correlate(frame, frame, mode="full")
+            ac = ac[ac.size // 2:]
+            if ac.size <= min_lag or ac[0] <= EPS:
                 continue
 
-            cur_max_lag = min(max_lag, len(ac) - 1)
-
+            cur_max_lag = min(max_lag, ac.size - 1)
             if cur_max_lag <= min_lag:
-                ac_peaks[i] = 0.0
                 continue
 
-            ac_peaks[i] = float(np.max(ac[min_lag:cur_max_lag + 1]))
+            peak = float(np.max(ac[min_lag:cur_max_lag + 1])) / (ac[0] + EPS)
+            harmonic[i] = peak >= 0.5 or (peak >= 0.35 and zcr[i] <= 0.35)
 
-        strong_periodic = mask & (ac_peaks >= 0.5)
-        moderate_periodic = mask & (ac_peaks >= 0.35)
-
-        low_zcr = zcr <= 0.35
-
-        voiced = strong_periodic | (moderate_periodic & low_zcr)
-
-        voiced_frames = int(np.sum(voiced[:n]))
-        active_frames = int(np.sum(mask[:n]))
-
-        ratio = float(voiced_frames)/float(active_frames + EPS)
-
+        ratio = float(np.sum(harmonic)) / float(np.sum(mask) + EPS)
         self._cache_time[key] = ratio
         return ratio
-    
+
+    def _voiced_ratio(self, db_threshold: float = -60.0) -> float:
+        """Backward-compatible alias for harmonicity; not a vocal detector."""
+        return self._harmonic_ratio(db_threshold=db_threshold)
+
     def _unvoiced_ratio(self) -> float:
-        return 1.0 - self._voiced_ratio()
+        return 1.0 - self._harmonic_ratio()
     
     def _transient_rate(self) -> float:
         key = "transient_rate"
@@ -548,8 +556,8 @@ class TimeFeatures():
             distance=min_distance
         )
 
-        duration = len(self.y) / float(self.sr)
-        rate = float(len(peaks)) / duration
+        duration = len(self.y) / float(self.sr) if self.sr > 0 else 0.0
+        rate = float(len(peaks)) / duration if duration > EPS else 0.0
 
         self._cache_time[key] = rate
         return rate
@@ -563,31 +571,36 @@ class TimeFeatures():
     # Rhythm/Beats Features
     def _onset_times(self) -> np.ndarray:
         """
-        Return onset times (seconds) from peaks in onset envelope
+        Return onset times (seconds) derived from the canonical _onset_frames()
+        so all onset-derived features use the same event set.
         """
         key = "onset_times"
         if key in self._cache_time:
             return self._cache_time[key]
-        
-        onset_env = self._onset_envelope()['onset_env']
 
-        if onset_env.size == 0:
+        frames = self._onset_frames()  # single source of truth
+
+        if frames.size == 0:
             self._cache_time[key] = np.array([], dtype=float)
             return self._cache_time[key]
-        
-        # Adaptive threshold: median + k*MAD
-        med = np.median(onset_env)
-        mad = np.median(np.abs(onset_env - med))
-        thr = med + 2.0*mad
 
-        # Find peaks above threshold
-        peaks, _ = find_peaks(onset_env, height=thr)
+        onset_cfg = self._onset_envelope()
+        centered = onset_cfg.get("times", np.array([], dtype=float)).size > 0 and onset_cfg["times"][0] > 0.0
+        if centered:
+            times = librosa.frames_to_time(
+                frames, sr=self.sr, hop_length=self.H, n_fft=self.N
+            )
+        else:
+            times = librosa.frames_to_time(
+                frames, sr=self.sr, hop_length=self.H
+            )
 
-        # Convert frame indices to time (seconds)
-        times = (peaks*self.H)/float(self.sr)
+        # Never let center-padding create onset times beyond the actual signal.
+        duration = len(self.y) / float(self.sr)
+        times = times[times < max(duration, self.H / float(self.sr))]
 
         self._cache_time[key] = times.astype(float)
-        return times.astype(float)
+        return self._cache_time[key]
     
     def _onset_rate(self) -> float:
         """
@@ -595,7 +608,7 @@ class TimeFeatures():
         """
         key = "onset_rate"
         if key in self._cache_time:
-            return self._cache_time["onset_rate"]
+            return self._cache_time[key]
         
         onset_times = self._onset_times()
         if onset_times.size == 0:
@@ -702,160 +715,69 @@ class TimeFeatures():
 
         return float(x - 0.5*(a - c)/denom)
     
-    def _tempo_from_onset_ac(self,
-                            bpm_min=40.0,
-                            bpm_max=240.0) -> float:
+    def _tempo_from_onset_ac(
+        self, bpm_min: float = 40.0, bpm_max: float = 240.0
+    ) -> float:
         """
-        Estimate global tempo (BPM) from onset autocorrelation
-        
-        Strategy:
-        1. Compute autocorrelation of onset envelope
-        2. Find peaks in the valid BPM range
-        3. Check octave relationships (2x, 3x, 1/2, 1/3, etc.)
-        4. Select best candidate using strength + preference weighting
-        
-        Parameters
-        ----------
-        bpm_min : float
-            Minimum tempo to consider (default: 40 BPM)
-        bpm_max : float
-            Maximum tempo to consider (default: 240 BPM)
-        
-        Returns
-        -------
-        float
-            Estimated tempo in BPM
+        Estimate global tempo (BPM) from the onset envelope.
+
+        Uses librosa's established tempo estimator rather than imposing a
+        custom 80--160 BPM preference. The search range is still constrained
+        to the requested musical BPM interval.
         """
         key = f"tempo_from_onset_ac_{bpm_min}_{bpm_max}"
         if key in self._cache_time:
             return self._cache_time[key]
-        
-        # Get autocorrelation
-        ac = self._onset_autocorrelation()
-        onset = self._onset_envelope()
-        frame_rate = onset.get('frame_rate', self.sr/float(self.H))
 
-        if ac.size < 2:
+        onset_env = self._onset_envelope()["onset_env"]
+        if onset_env.size < 3 or np.all(onset_env <= EPS):
             self._cache_time[key] = 0.0
             return 0.0
 
-        # Convert lags to BPM
-        lags = np.arange(len(ac))
-        bpm = np.zeros_like(lags,dtype=float)
-        bpm[1:] = 60.0*frame_rate/lags[1:]
-
-        # Filter to valid range
-        mask = (bpm >= bpm_min) & (bpm <= bpm_max) & np.isfinite(bpm)
-        if not np.any(mask):
+        mask = self._active_rms_mask(db_threshold=-60.0)
+        if mask.size == 0 or not np.any(mask):
             self._cache_time[key] = 0.0
             return 0.0
-        
-        # Find strongest peak in valid range
-        valid_ac = ac[mask]
-        valid_bpm = bpm[mask]
-        valid_lags = lags[mask]
 
-        peak_idx = np.argmax(valid_ac)
-        detected_bpm = valid_bpm[peak_idx]
-        detected_lag = valid_lags[peak_idx]
-        detected_strength = valid_ac[peak_idx]
+        frame_rate = self.sr / float(self.H)
+        try:
+            tempo_array = librosa.feature.tempo(
+                onset_envelope=onset_env,
+                sr=self.sr,
+                hop_length=self.H,
+                start_bpm=120.0,
+                max_tempo=float(bpm_max),
+                aggregate=np.mean,
+            )
+            tempo = float(np.asarray(tempo_array).reshape(-1)[0])
+        except Exception:
+            # Conservative fallback: strongest autocorrelation peak within the
+            # requested BPM range. This keeps the class usable across librosa
+            # versions where tempo APIs differ.
+            ac = self._onset_autocorrelation()
+            lag_min = max(1, int(np.floor(60.0 * frame_rate / bpm_max)))
+            lag_max = min(ac.size - 1, int(np.ceil(60.0 * frame_rate / bpm_min)))
+            if lag_max <= lag_min:
+                self._cache_time[key] = 0.0
+                return 0.0
 
-        # ===================================================================
-        # OCTAVE CORRECTION WITH AGGRESSIVE WEIGHTING
-        # ===================================================================
-        candidates = []
+            region = ac[lag_min:lag_max + 1]
+            peak_lag = lag_min + int(np.argmax(region))
+            refined_lag = (
+                self._parabolic_interpolation(ac, peak_lag)
+                if 1 <= peak_lag < ac.size - 1
+                else float(peak_lag)
+            )
+            tempo = 60.0 * frame_rate / max(refined_lag, 1.0)
 
-        # Add initial detection
-        candidates.append({
-            'bpm': detected_bpm,
-            'lag': detected_lag,
-            'strength': detected_strength,
-            'label': 'initial'
-        })
-
-        # Helper: find peak near a target BPM with wider search window
-        def find_peak_near(target_bpm, label, search_radius=3):
-            """
-            Find actual peak near target BPM
-            """
-            if not (bpm_min <= target_bpm <= bpm_max):
-                return
-            
-            target_lag = 60.0*frame_rate/target_bpm
-            lag_start = max(1, int(np.round(target_lag)) - search_radius)
-            lag_end = min(len(ac), int(np.round(target_lag)) + search_radius + 1)
-
-            if lag_start >= lag_end:
-                return
-
-            # Find maximum in search window
-            search_window = ac[lag_start:lag_end]
-            local_max_idx = np.argmax(search_window)
-            actual_lag = lag_start + local_max_idx
-            actual_strength = ac[actual_lag]
-            actual_bpm = 60*frame_rate/actual_lag
-
-            candidates.append({
-                'bpm': actual_bpm,
-                'lag': actual_lag,
-                'strength': actual_strength,
-                'label': label 
-            })
-
-        # Check ALL octave relationships
-        find_peak_near(detected_bpm * 2.0, '2x')
-        find_peak_near(detected_bpm * 3.0, '3x')
-        find_peak_near(detected_bpm * 4.0, '4x')
-        find_peak_near(detected_bpm / 2.0, '1/2')
-        find_peak_near(detected_bpm / 3.0, '1/3')
-        find_peak_near(detected_bpm / 4.0, '1/4')
-        find_peak_near(detected_bpm * 3.0 / 2.0, '3/2')
-        find_peak_near(detected_bpm * 2.0 / 3.0, '2/3')
-
-        # ===================================================================
-        # SELECTION: MUCH STRONGER PREFERENCE FOR TYPICAL RANGE
-        # ===================================================================
-        max_strength = max(c['strength'] for c in candidates)
-
-        # Only consider candidates >= 50% of max strength
-        threshold = max_strength*0.5
-        strong_candidates = [c for c in candidates if c['strength'] >= threshold]
-
-        if not strong_candidates:
-            strong_candidates = candidates
-
-        best_score = -1
-        best_bpm = detected_bpm
-
-        for cand in strong_candidates:
-            score = cand['strength']
-
-            # ===============================================================
-            # VERY AGGRESSIVE PREFERENCE FOR TYPICAL RANGE
-            # ===============================================================
-            if 80 <= cand['bpm'] <= 160:
-                score *= 2.5 # 150% boost
-            elif 60 <= cand['bpm'] <= 180:
-                score *= 1.3 # 30% boost
-
-            # Heavy penalty for extremes
-            if cand['strength'] < max_strength*0.95:
-                if cand['bpm'] < 60:
-                    score *= 0.6 # Stronger penalty
-                if cand['bpm'] > 200:
-                    score *= 0.6 # Stronger penalty
-
-            if score > best_score:
-                best_score = score
-                best_bpm = cand['bpm']
-
-        self._cache_time[key] = float(best_bpm)
-        return float(best_bpm)
+        tempo = float(np.clip(tempo, bpm_min, bpm_max))
+        self._cache_time[key] = tempo
+        return tempo
     
     def _pulse_clarity_ac(self) -> float:
         """
-        Pulse clarity from dominance of main AC peak over runner-up,
-        gated by absolute peak strength to suppress noise floor.
+        Pulse clarity based on the dominance of the strongest tempo-range
+        autocorrelation peak over the runner-up, gated by absolute strength.
         """
         key = "pulse_clarity_ac"
         if key in self._cache_time:
@@ -866,30 +788,29 @@ class TimeFeatures():
             self._cache_time[key] = 0.0
             return 0.0
 
-        ac_pos = ac[1:]
-        if ac_pos.size == 0:
+        frame_rate = self.sr / float(self.H)
+        lag_min = max(1, int(np.floor(60.0 * frame_rate / 240.0)))
+        lag_max = min(ac.size - 1, int(np.ceil(60.0 * frame_rate / 40.0)))
+        if lag_max <= lag_min:
             self._cache_time[key] = 0.0
             return 0.0
 
-        peaks, _ = find_peaks(ac_pos, prominence=0.01)
+        search = ac[lag_min:lag_max + 1]
+        peaks, _ = find_peaks(search, prominence=max(0.01, 0.05 * float(np.std(search))))
 
-        if len(peaks) == 0:
+        if peaks.size == 0:
             self._cache_time[key] = 0.0
             return 0.0
 
-        top_peak = float(ac_pos[peaks].max())
+        strengths = np.asarray(search[peaks], dtype=float)
+        strengths = np.sort(strengths)[::-1]
+        top = float(strengths[0])
+        runner_up = float(strengths[1]) if strengths.size > 1 else 0.0
 
-        STRONG_FLOOR = 0.50
-        WEAK_FLOOR = 0.15
+        dominance = (top - runner_up) / (abs(top) + EPS)
+        absolute_strength = safe_clip01((top + 1.0) / 2.0)
+        clarity = float(np.clip(dominance * np.sqrt(absolute_strength), 0.0, 1.0))
 
-        if top_peak >= STRONG_FLOOR:
-            clarity = 0.60 + 0.4*(top_peak - STRONG_FLOOR)/(1.0 - STRONG_FLOOR)
-        elif top_peak >= WEAK_FLOOR:
-            clarity = 0.15 + 0.45*(top_peak - WEAK_FLOOR)/(STRONG_FLOOR - WEAK_FLOOR)
-        else:
-            clarity = top_peak/WEAK_FLOOR*0.15
-
-        clarity = float(np.clip(clarity, 0.0, 1.0))
         self._cache_time[key] = clarity
         return clarity
     
@@ -905,11 +826,15 @@ class TimeFeatures():
         
         fs_env = self.sr/float(self.H)
         win_len = int(window_sec*fs_env)
-        hop_len = int(hop_sec*fs_env)
 
         if win_len < 3:
             return np.array([], dtype=float)
-        
+
+        if hop_sec <= 0:
+            return np.array([], dtype=float)
+
+        hop_len = max(1, int(np.ceil(hop_sec * fs_env)))
+
         tempos = []
         start = 0
         
@@ -985,7 +910,13 @@ class TimeFeatures():
 
         tempos = self._windowed_tempo_series()
         if tempos.size < 2:
-            result = {"tempo_var": 0.0, "stability_exp": 1.0, "stability_cv": 1.0}
+            # Insufficient evidence is not evidence of perfect stability.
+            result = {
+                "tempo_var": 0.0,
+                "stability_exp": 0.5,
+                "stability_cv": 0.5,
+                "confidence": 0.0,
+            }
             self._cache_time["rhythmic_stability"] = result
             return result
 
@@ -1019,46 +950,103 @@ class TimeFeatures():
 
         stability_cv = float(np.clip(1.0 - cv, 0.0, 1.0))
 
+        confidence = float(np.clip(tempos.size / 4.0, 0.0, 1.0))
         result = {
             "tempo_var":     var_tempo,
             "stability_exp": stability_exp,
             "stability_cv":  stability_cv,
+            "confidence":    confidence,
         }
         self._cache_time["rhythmic_stability"] = result
         return result
     
-    def _beat_periodicity_entropy(self, num_bins: int = 20) -> float:
-        """ 
-        Entropy-based beat periodicity from IOI histogram
+    def _onset_periodicity_entropy(self, num_bins: int = 20) -> float:
         """
+        Entropy-based regularity of detected onset spacing.
+
+        This is intentionally named *onset* periodicity because IOIs are not
+        necessarily musical beat intervals.
+        """
+        key = f"onset_periodicity_entropy_{num_bins}"
+        if key in self._cache_time:
+            return self._cache_time[key]
+
         ioi = self._ioi_values()
         if ioi.size < 3:
             return 0.0
 
-        # Limit IOI range to sensible beat intervals
-        ioi_clipped = ioi[(ioi > 0.1) & (ioi < 2.0)]
+        # Use a broad musical IOI range; do not hard-code a 2-second upper limit.
+        ioi_clipped = ioi[(ioi > 0.05) & (ioi < 4.0)]
         if ioi_clipped.size < 3:
             return 0.0
-        
-        hist, edges = np.histogram(ioi_clipped, bins=num_bins, density=False)
+
+        hist, _ = np.histogram(ioi_clipped, bins=num_bins, density=False)
         total = np.sum(hist)
         if total == 0:
             return 0.0
 
-        p = hist.astype(float)/float(total)
+        p = hist.astype(float) / float(total)
         p = p[p > 0.0]
+        entropy = -np.sum(p * np.log2(p))
+        h_max = np.log2(num_bins)
+        periodicity = 1.0 - (entropy / h_max if h_max > 0 else 1.0)
 
-        # Shannon entropy (bits)
-        H = -np.sum(p*np.log2(p))
+        periodicity = float(np.clip(periodicity, 0.0, 1.0))
+        self._cache_time[key] = periodicity
+        return periodicity
 
-        H_max = np.log2(num_bins)
-        if H_max <= 0:
+    def _beat_periodicity_entropy(self, num_bins: int = 20) -> float:
+        """Backward-compatible alias for onset-spacing periodicity."""
+        return self._onset_periodicity_entropy(num_bins=num_bins)
+
+    def _ac_value(self, ac: np.ndarray, lag: float) -> float:
+        """Linearly interpolated autocorrelation value at a fractional lag."""
+        if ac.size == 0 or lag < 0 or lag >= ac.size:
+            return 0.0
+        lo = int(np.floor(lag))
+        hi = min(lo + 1, ac.size - 1)
+        frac = float(lag - lo)
+        return float((1.0 - frac) * ac[lo] + frac * ac[hi])
+
+    def _beat_regularity_from_tempo(self, tempo_bpm: float | None = None) -> float:
+        """
+        Estimate beat-period regularity from onset-envelope autocorrelation
+        after anchoring the lag search to the estimated tempo.
+        """
+        key = f"beat_regularity_{tempo_bpm}"
+        if key in self._cache_time:
+            return self._cache_time[key]
+
+        if tempo_bpm is None or tempo_bpm <= 0.0:
+            tempo_bpm = self._spotify_tempo()
+
+        if tempo_bpm <= 0.0:
+            self._cache_time[key] = 0.0
             return 0.0
 
-        periodicity = 1.0 - (H/H_max)
-        periodicity = float(np.clip(periodicity, 0.0, 1.0))
-        return periodicity 
-    
+        ac = self._onset_autocorrelation()
+        if ac.size < 3:
+            self._cache_time[key] = 0.0
+            return 0.0
+
+        fs_env = self.sr / float(self.H)
+        beat_lag = 60.0 * fs_env / float(tempo_bpm)
+
+        vals = []
+        for multiple in (1.0, 2.0, 4.0):
+            lag = beat_lag * multiple
+            window = max(1, int(round(0.04 * fs_env)))
+            center = int(round(lag))
+            lo = max(1, center - window)
+            hi = min(ac.size - 1, center + window)
+            if lo <= hi:
+                vals.append(float(np.max(ac[lo:hi + 1])))
+
+        regularity = float(np.mean(vals)) if vals else 0.0
+        regularity = safe_clip01((regularity + 1.0) / 2.0)
+        self._cache_time[key] = regularity
+        return regularity
+
     # Correlation/Structure
     def _autocorrelation(self) -> np.ndarray:
         """ 
@@ -1136,26 +1124,40 @@ class TimeFeatures():
         return {"lag1": r1,
                 "lag2": r2}
     
-    def _frames(self) -> np.ndarray:
-        """ 
-        Return framed signal: shape (num_frames, frame_length)
-        Uses frame length self.N and hop self.H
+    def _frames(self) -> dict:
         """
-        if "frames" in self._cache_time:
-            return self._cache_time["frames"]
-        
+        Returns descriptive statistics of the framed signal rather than
+        the raw array, so downstream exporters receive scalars.
+        """
+        key = "frames"
+        if key in self._cache_time:
+            return self._cache_time[key]
+
         L = len(self.y)
         if L < self.N:
-            self.cache_time["frames"] = np.empty((0, self.N), dtype=float)
-            return self._cache_time["frames"]
-        
-        # Use librosa.util.frame for efficient framing (returns shape (frame_length, num_frames))
-        y_padded = np.pad(self.y, int(self.N//2), mode='reflect')
-        framed = librosa.util.frame(y_padded, frame_length=self.N, hop_length=self.H)
-        frames = framed.T.astype(float) # shape (num_frames, N)
+            result = {
+                "num_frames": 0,
+                "mean_frame_energy": 0.0,
+                "std_frame_energy": 0.0,
+                "max_frame_energy": 0.0,
+            }
+            self._cache_time[key] = result
+            return result
 
-        self._cache_time["frames"] = frames
-        return frames
+        y_padded = np.pad(self.y, int(self.N // 2), mode='reflect')
+        framed = librosa.util.frame(y_padded, frame_length=self.N, hop_length=self.H)
+        # framed shape: (frame_length, num_frames)
+        frame_energies = np.sqrt(np.mean(framed ** 2, axis=0))  # RMS per frame
+
+        result = {
+            "num_frames":        int(framed.shape[1]),
+            "mean_frame_energy": float(np.mean(frame_energies)),
+            "std_frame_energy":  float(np.std(frame_energies)),
+            "max_frame_energy":  float(np.max(frame_energies)),
+        }
+
+        self._cache_time[key] = result
+        return result
     
     def _self_similarity_matrix(self) -> np.ndarray:
         """ 
@@ -1165,7 +1167,13 @@ class TimeFeatures():
         if "self_sim" in self._cache_time:
             return self._cache_time["self_sim"]
         
-        frames = self._frames()
+        L = len(self.y)
+        if L < self.N:
+            self._cache_time["self_sim"] = np.zeros((0, 0), dtype=float)
+            return self._cache_time["self_sim"]
+        y_padded = np.pad(self.y, int(self.N // 2), mode='reflect')
+        framed = librosa.util.frame(y_padded, frame_length=self.N, hop_length=self.H)
+        frames = framed.T.astype(float)  # shape (num_frames, N)
         if frames.shape[0] == 0:
             self._cache_time["self_sim"] = np.zeros((0, 0), dtype=float)
             return self._cache_time["self_sim"]
@@ -1467,243 +1475,280 @@ class TimeFeatures():
 
         return ratio
     
-    # Spotify-based features (Time)
-    def _spotify_loudness(self, active_only: bool = True) -> float:
-        key = f"spotify_loudness_{active_only}"
+    # Time-domain feature evidence
+    #
+    # These methods intentionally produce domain-specific evidence for the
+    # central fusion layer. They do not reproduce Spotify's proprietary
+    # Audio Features model or scoring functions.
+
+    def _time_loudness_db(self, active_only: bool = True) -> float:
+        """Return an RMS-based dBFS loudness proxy for time-domain evidence."""
+        key = f"time_loudness_db_{active_only}"
         if key in self._cache_time:
             return self._cache_time[key]
-        
+
         if getattr(self, "invalid", False):
+            self._cache_time[key] = -80.0
+            return -80.0
+
+        if self.y.size == 0:
             self._cache_time[key] = -80.0
             return -80.0
 
         if active_only:
             rms = self._rms_envelope()
             mask = self._active_rms_mask(db_threshold=-60.0)
-            if mask.size == 0 or not np.any(mask):
-                val = -80.0
+            n = min(rms.size, mask.size)
+            active = rms[:n][mask[:n]]
+            if active.size == 0:
+                value = -80.0
             else:
-                rms_active = np.sqrt(np.mean(rms[mask]**2)) + EPS
-                val = 20.0*np.log10(rms_active)
+                rms_active = float(np.sqrt(np.mean(active ** 2)))
+                value = 20.0 * np.log10(max(rms_active, EPS))
         else:
-            rms = np.sqrt(np.mean(self.y**2)) + EPS
-            val = 20.0*np.log10(rms)
+            rms_value = float(np.sqrt(np.mean(self.y.astype(float) ** 2)))
+            value = 20.0 * np.log10(max(rms_value, EPS)) if rms_value > 0.0 else -80.0
 
-        val = float(max(val, -80.0))
+        value = float(np.clip(value, -80.0, 0.0))
+        self._cache_time[key] = value
+        return value
 
-        self._cache_time[key] = val
-        return val
-    
-    def _spotify_energy(self, active_only: bool  = True) -> float:
-        key = f"spotify_energy_{active_only}"
+    def _time_energy(self, active_only: bool = True) -> float:
+        """
+        Return a track-relative time-domain activity/energy score in [0, 1].
+
+        This is intentionally relative to the recording's own RMS distribution;
+        it is not an absolute or perceptual Spotify energy estimate.
+        """
+        key = f"time_energy_{active_only}"
         if key in self._cache_time:
             return self._cache_time[key]
-        
+
         if getattr(self, "invalid", False):
             self._cache_time[key] = 0.0
             return 0.0
-        
-        ste = self._short_time_energy()
-        if ste.size == 0:
+
+        rms = self._rms_envelope()
+        if rms.size == 0:
             self._cache_time[key] = 0.0
             return 0.0
-        
+
         if active_only:
             mask = self._active_rms_mask(db_threshold=-60.0)
-            if mask.size == 0 or not np.any(mask):
-                avg_ste = 0.0
-            else:
-                avg_ste = float(np.mean(ste[mask]))
+            n = min(rms.size, mask.size)
+            active = rms[:n][mask[:n]]
+            if active.size == 0:
+                self._cache_time[key] = 0.0
+                return 0.0
+            level = float(np.median(active))
+            reference = active
         else:
-            avg_ste = float(np.mean(ste))
+            level = float(np.median(rms))
+            reference = rms
 
-        # Normalize intensity to a roughly 0-1 scale using sigmoid-like squash
-        intensity_score = np.tanh(avg_ste/(np.median(ste) + EPS))
+        q10, q90 = np.percentile(reference, [10.0, 90.0])
+        denom = max(float(q90 - q10), EPS)
+        level_score = safe_clip01((level - q10) / denom)
 
-        # 2. Rhythmic Activity Component (Onset Rate & Pulse Clarity)
-        # High energy tracks are usually "busier" with more transients.
-        onset_rate = self._onset_rate()
-        # Normalize onset rate (e.g., 0 to 12 onsets/sec mapped to 0-1)
-        activity_score = np.clip(onset_rate / 10.0, 0.0, 1.0)
-        
-        # 3. Complexity & Noise Component (ZCR & Hjorth Complexity)
-        # Distorted or high-frequency heavy signals (high energy) have higher ZCR.
-        zcr = np.mean(self._zero_crossing_rate())
-        zcr_score = np.clip(zcr * 5.0, 0.0, 1.0) 
+        onset_rate_score = safe_clip01(self._onset_rate() / 8.0)
 
-        # 4. Temporal Dynamics (Attack Slopes & Peak Amplitude)
-        # "Punchy" music has steeper attack slopes and higher crest factors.
-        crest_factor_values = self._crest_factor()
-        if np.ndim(crest_factor_values) > 0:
-            active_mask = self._active_rms_mask(db_threshold=-60.0)
-            active_crest = crest_factor_values[active_mask] if active_mask.size else crest_factor_values
-            crest_factor = float(np.mean(active_crest)) if active_crest.size else 0.0
-        else:
-            crest_factor = float(crest_factor_values)
+        crest = self._crest_factor()
+        mask = self._active_rms_mask(db_threshold=-60.0)
+        n = min(crest.size, mask.size)
+        active_crest = crest[:n][mask[:n]]
+        crest_value = float(np.median(active_crest)) if active_crest.size else 1.0
+        crest_score = safe_clip01((crest_value - 1.0) / 6.0)
 
-        dynamic_score = np.clip((crest_factor - 1.0) / 10.0, 0.0, 1.0)
-
-        # ===================================================================
-        # WEIGHTED FUSION
-        # ===================================================================
-        # Weights prioritize Intensity and Activity as the primary drivers.
-        weights = {
-            'intensity': 0.40,
-            'activity':  0.30,
-            'zcr':       0.15,
-            'dynamics':  0.15
-        }
-
-        energy_val = (
-            (intensity_score * weights['intensity']) +
-            (activity_score  * weights['activity']) +
-            (zcr_score       * weights['zcr']) +
-            (dynamic_score   * weights['dynamics'])
+        value = safe_clip01(
+            0.65 * level_score +
+            0.20 * onset_rate_score +
+            0.15 * crest_score
         )
+        self._cache_time[key] = value
+        return value
 
-        final_energy = float(np.clip(energy_val, 0.0, 1.0))
+    def _time_speechiness_evidence(self) -> float:
+        """
+        Return weak time-domain speech-like evidence in [0, 1].
 
-        self._cache_time[key] = final_energy
-        return final_energy
-    
-    def _spotify_speechiness(self) -> float:
+        ZCR variability and non-harmonicity are supporting signals only; this
+        method must not be treated as a vocal/speech classifier.
         """
-        Estimate speechiness by analyzing Zero-Crossing Rate (ZCR) stability,
-        spectral complexity, and the ratio of voiced to unvoiced segments.
-        """
-        key = "spotify_speechiness"
+        key = "time_speechiness_evidence"
         if key in self._cache_time:
             return self._cache_time[key]
-        
+
         if getattr(self, "invalid", False):
             self._cache_time[key] = 0.0
             return 0.0
-        
-        # 1. ZCR Variance (Speech Indicator)
-        # Speech has highly varible ZCR compared to the consistent cycles of music
-        zcr = self._zero_crossing_rate()
-        zcr_var = np.var(zcr) if zcr.size > 0 else 0.0
-        # Normalize: Speech usually has higher variance than stable musical tones.
-        zcr_score = safe_clip01(zcr_var*100.0)
 
-        # 2. Vocal/Unvoiced Ratio
-        # This directly targets the phonetic components of speech
-        vocal_ratio = self._unvoiced_ratio()
-        v_u_score = safe_clip01(vocal_ratio)
+        mask = self._active_rms_mask(db_threshold=-60.0)
+        if mask.size == 0 or not np.any(mask):
+            self._cache_time[key] = 0.0
+            return 0.0
 
-        # 3. Spectral Entropy/Complexity
-        # Speech is often more "complex" (less predictable) than harmonic music.
-        # We can use Hjorth Complexity or Fractal Dimension as a proxy
-        complexity = self._hjorth_parameters()["complexity"]
-        complexity_score = safe_clip01((complexity - 1.0)/5.0)
+        zcr_disp = self._zcr_iqr_ratio()
+        harmonic_ratio = self._harmonic_ratio()
 
-        # 4. Rhythmic Stability Penalty
-        # Music is periodic; speech is not. High beat periodicity lowers speechiness.
-        periodicity = self._beat_periodicity_entropy()
-        rhythm_penalty = 1.0 - safe_clip01(periodicity)
+        zcr_score = safe_clip01(zcr_disp / 1.5)
+        nonharmonic_score = safe_clip01(1.0 - harmonic_ratio)
 
-        # ===================================================================
-        # WEIGHTED FUSION
-        # ===================================================================
-        # Vocal components and ZCR variance are the strongest indicators.
-        weights = {
-            'vocal': 0.45,
-            'zcr_var': 0.25,
-            'complexity': 0.15,
-            'non_rhythmic': 0.15
-        }
-
-        speech_val = (
-            (v_u_score*weights['vocal']) + 
-            (zcr_score*weights['zcr_var']) + 
-            (complexity_score*weights['complexity']) +
-            (rhythm_penalty*weights['non_rhythmic'])
+        value = safe_clip01(
+            0.65 * zcr_score +
+            0.35 * nonharmonic_score
         )
+        self._cache_time[key] = value
+        return value
 
-        # Spotify Thresholds:
-        # > 0.66: Entirely spoken
-        # 0.33 - 0.66: Mix of speech and music (Rap)
-        # < 0.33: Mostly music
-        val = safe_clip01(speech_val)
+    def _time_acousticness_evidence(self) -> float:
+        """
+        Return weak envelope/timbre smoothness evidence in [0, 1].
 
-        self._cache_time[key] = val
-        return val
-
-    def _spotify_acousticness(self) -> float:
-        key = "spotify_acousticness"
+        This is not acousticness classification. Frequency and MFCC domains
+        should carry most of the acousticness evidence.
+        """
+        key = "time_acousticness_evidence"
         if key in self._cache_time:
             return self._cache_time[key]
-        
+
         if getattr(self, "invalid", False):
             self._cache_time[key] = 0.0
             return 0.0
-        
+
+        mask = self._active_rms_mask(db_threshold=-60.0)
+        if mask.size == 0 or not np.any(mask):
+            self._cache_time[key] = 0.0
+            return 0.0
+
         rms = self._rms_envelope()
         if rms.size < 2:
             self._cache_time[key] = 0.0
             return 0.0
-        
+
         diffs = np.abs(np.diff(rms))
-        smoothness = 1.0 - np.mean(diffs)/(np.mean(rms) + EPS)
+        smoothness = 1.0 - float(np.mean(diffs)) / (float(np.mean(rms)) + EPS)
+        smooth_score = safe_clip01(smoothness)
 
         attack_time = self._attack_time()
-        attack_slope = self._attack_slope()
         decay_slope = self._decay_slope()
         silence = self._silence_ratio(db_threshold=-60.0)
 
-        attack_score = safe_clip01(attack_time/(attack_time + 0.05))
-        attack_slope_score = safe_clip01(1.0/(1.0 + abs(attack_slope)/50.0))
-        decay_score = safe_clip01(1.0/(1.0 + abs(decay_slope)/50.0))
-        smooth_score = safe_clip01(smoothness)
+        attack_score = safe_clip01(attack_time / (attack_time + 0.05))
+        decay_score = safe_clip01(1.0 / (1.0 + abs(decay_slope) / 60.0))
         silence_score = safe_clip01(silence)
 
-        w_at = 0.20
-        w_as = 0.20
-        w_d = 0.20
-        w_sm = 0.30
-        w_ss = 0.10
+        value = safe_clip01(
+            0.45 * smooth_score +
+            0.25 * attack_score +
+            0.20 * decay_score +
+            0.10 * silence_score
+        )
+        self._cache_time[key] = value
+        return value
 
-        val = w_sm*smooth_score + w_at*attack_score + w_as*attack_slope_score + w_d*decay_score + w_ss*silence_score
-        val = safe_clip01(val)
+    def _time_danceability_evidence(self, tempo_bpm: float | None = None) -> float:
+        """
+        Return time-domain rhythmic/danceability evidence in [0, 1].
 
-        self._cache_time[key] = val
-        return val
-
-    def _spotify_danceability(self) -> float:
-        key = "spotify_danceability"
+        Tempogram analysis should be the primary source for the final
+        danceability estimate; this method is a supporting time-domain signal.
+        """
+        key = f"time_danceability_evidence_{tempo_bpm}"
         if key in self._cache_time:
             return self._cache_time[key]
-        
+
         if getattr(self, "invalid", False):
             self._cache_time[key] = 0.0
             return 0.0
-        
+
+        mask = self._active_rms_mask(db_threshold=-60.0)
+        if mask.size == 0 or not np.any(mask):
+            self._cache_time[key] = 0.0
+            return 0.0
+
+        if tempo_bpm is None or tempo_bpm <= 0.0:
+            tempo_bpm = self._time_tempo_bpm()
+
+        pulse = self._pulse_clarity_ac()
+        beat_regularity = self._beat_regularity_from_tempo(tempo_bpm)
+        stability = self._rhythmic_stability()
+        onset_rate = self._onset_rate()
+
+        stability_score = safe_clip01(
+            0.5 * stability.get("stability_exp", 0.5) +
+            0.5 * stability.get("stability_cv", 0.5)
+        )
+        onset_score = safe_clip01(onset_rate / 8.0)
+
+        value = safe_clip01(
+            0.35 * pulse +
+            0.30 * beat_regularity +
+            0.20 * stability_score +
+            0.10 * onset_score +
+            0.05 * safe_clip01(stability.get("confidence", 0.0))
+        )
+        self._cache_time[key] = value
+        return value
+
+    def _time_tempo_bpm(
+        self,
+        bpm_min: float = 40.0,
+        bpm_max: float = 240.0,
+    ) -> float:
+        """Return the time-domain BPM estimate without claiming Spotify parity."""
+        key = f"time_tempo_bpm_{bpm_min}_{bpm_max}"
+        if key in self._cache_time:
+            return self._cache_time[key]
+
+        if getattr(self, "invalid", False):
+            self._cache_time[key] = 0.0
+            return 0.0
+
+        tempo = self._tempo_from_onset_ac(bpm_min=bpm_min, bpm_max=bpm_max)
+        if tempo <= 0.0:
+            self._cache_time[key] = 0.0
+            return 0.0
+
+        value = float(np.clip(tempo, bpm_min, bpm_max))
+        self._cache_time[key] = value
+        return value
+
+    def _time_tempo_confidence(self, tempo_bpm: float | None = None) -> float:
+        """Estimate confidence in the time-domain tempo evidence."""
+        key = f"time_tempo_confidence_{tempo_bpm}"
+        if key in self._cache_time:
+            return self._cache_time[key]
+
+        if getattr(self, "invalid", False):
+            self._cache_time[key] = 0.0
+            return 0.0
+
+        if tempo_bpm is None or tempo_bpm <= 0.0:
+            tempo_bpm = self._time_tempo_bpm()
+        if tempo_bpm <= 0.0:
+            self._cache_time[key] = 0.0
+            return 0.0
+
+        onset_env = self._onset_envelope()["onset_env"]
+        if onset_env.size < 8 or np.max(onset_env) <= EPS:
+            self._cache_time[key] = 0.0
+            return 0.0
+
         pulse = self._pulse_clarity_ac()
         stability = self._rhythmic_stability()
-        periodicity = self._beat_periodicity_entropy()
-        onset_rate = self._onset_rate()
-        tempo = self._tempo_from_onset_ac()
+        sample_conf = safe_clip01(stability.get("confidence", 0.0))
 
-        tempo_score = safe_clip01(1.0 - abs(tempo - 120.0)/120.0)
-        onset_score = safe_clip01(onset_rate/(onset_rate + 5.0))
-        pulse_score = safe_clip01(pulse)
-        periodicity_score = safe_clip01(periodicity)
-        stability_score = safe_clip01(0.5*stability.get("stability_exp", 0.0) + 0.5*stability.get("stability_cv", 0.0))
+        value = safe_clip01(0.70 * pulse + 0.30 * sample_conf)
+        self._cache_time[key] = value
+        return value
 
-        w_temp = 0.15
-        w_onset = 0.10
-        w_pulse = 0.30
-        w_per = 0.20
-        w_stab = 0.25
+    def _time_performance_variability(self) -> float:
+        """
+        Return performance/dynamic variability evidence in [0, 1].
 
-        val = w_pulse*pulse_score + w_stab*stability_score + w_per*periodicity_score + w_temp*tempo_score + w_onset*onset_score
-        val = safe_clip01(val)
-
-        self._cache_time[key] = val
-        return val
-    
-    def _spotify_tempo(self) -> float:
-        key = "spotify_tempo"
+        This should not be interpreted as direct live-audience detection.
+        """
+        key = "time_performance_variability"
         if key in self._cache_time:
             return self._cache_time[key]
 
@@ -1711,208 +1756,290 @@ class TimeFeatures():
             self._cache_time[key] = 0.0
             return 0.0
 
-        # Get primary AC estimate
-        tempo = self._tempo_from_onset_ac()
-        
-        # Sanity check: Use Onset Rate (transients per second)
-        # 90 BPM is 1.5 beats/sec. 180 BPM is 3 beats/sec.
-        # If onsets/sec is very high, but tempo is low, double it.
-        onsets_per_sec = self._onset_rate()
-        
-        if tempo < 90.0 and onsets_per_sec > 3.5:
-            # Likely an octave error (e.g., your 90 BPM vs 143 BPM error)
-            tempo *= 2.0
-        elif tempo > 160.0 and onsets_per_sec < 2.0:
-            # Likely a double-time error
-            tempo /= 2.0
-
-        final_val = float(np.clip(tempo, 40.0, 240.0))
-        self._cache_time[key] = final_val
-        return final_val
-
-    def _spotify_liveness(self) -> float:
-        key = "spotify_liveness"
-        if key in self._cache_time:
-            return self._cache_time[key]
-
-        if getattr(self, "invalid", False):
+        mask = self._active_rms_mask(db_threshold=-60.0)
+        if mask.size == 0 or not np.any(mask):
             self._cache_time[key] = 0.0
             return 0.0
-        
-        trans_rate = self._transient_rate()
-        attack_time = self._attack_time()
-        attack_slope = self._attack_slope()
-        decay_slope = self._decay_slope()
-        tempo_var = self._rhythmic_stability().get("tempo_var", 0.0)
-        zcr_var = self._zcr_variance()
 
-        trans_score = safe_clip01(trans_rate/(trans_rate + 3.0))
-        attack_score = safe_clip01(1.0 - attack_time/(attack_time + 0.15))
-        attack_slope_score = safe_clip01(abs(attack_slope)/(abs(attack_slope) + 20.0))
-        decay_score = safe_clip01(abs(decay_slope)/(abs(decay_slope) + 20.0))
-        tempo_var_score = safe_clip01(tempo_var/(tempo_var + 10.0))
-        zcr_score = safe_clip01(zcr_var/(1.0 + zcr_var))
-
-        w_t = 0.25
-        w_attk = 0.20
-        w_atks = 0.20
-        w_d = 0.15
-        w_tv = 0.10
-        w_zcr = 0.10
-
-        val = w_t*trans_score + w_attk*attack_score + w_atks*attack_slope_score + w_d*decay_score + w_tv*tempo_var_score + w_zcr*zcr_score
-        val = safe_clip01(val)
-
-        self._cache_time[key] = val
-        return val
-    
-    def _spotify_instrumentalness(self) -> float:
-        key = "spotify_instrumentalness"
-        if key in self._cache_time:
-            return self._cache_time[key]
-        
-        if getattr(self, "invalid", False):
-            self._cache_time[key] = 0.0
-            return 0.0
-        
-        rms = self._rms_envelope()
-        if rms.size < 2:
-            self._cache_time[key] = 0.0
-            return 0.0
-        
-        silence = self._silence_ratio(db_threshold=-60.0)
-        voiced = self._voiced_ratio(db_threshold=-60.0)
-        unvoiced = self._unvoiced_ratio()
-
-        attack_time = self._attack_time()
-        attack_slope = self._attack_slope()
-        decay_slope = self._decay_slope()
         transient_rate = self._transient_rate()
-        zcr_var = self._zcr_variance()
+        attack_time = self._attack_time()
+        attack_slope = self._attack_slope()
+        decay_slope = self._decay_slope()
+        stability = self._rhythmic_stability()
+        zcr_disp = self._zcr_iqr_ratio()
 
-        diffs = np.abs(np.diff(rms))
-        smoothness = 1.0 - (np.mean(diffs)/(np.mean(rms) + EPS))
-        smoothness = safe_clip01(smoothness)
+        transient_score = safe_clip01(transient_rate / (transient_rate + 4.0))
+        attack_irregularity = safe_clip01(1.0 - attack_time / (attack_time + 0.12))
+        dynamic_attack = safe_clip01(abs(attack_slope) / (abs(attack_slope) + 30.0))
+        dynamic_decay = safe_clip01(abs(decay_slope) / (abs(decay_slope) + 30.0))
+        tempo_var_score = safe_clip01(
+            stability.get("tempo_var", 0.0) /
+            (stability.get("tempo_var", 0.0) + 10.0)
+        )
+        zcr_score = safe_clip01(zcr_disp / (1.0 + zcr_disp))
 
-        silence_score = safe_clip01(silence)
-        nonvocal_score = safe_clip01(unvoiced)
+        value = safe_clip01(
+            0.25 * transient_score +
+            0.20 * attack_irregularity +
+            0.20 * dynamic_attack +
+            0.15 * dynamic_decay +
+            0.10 * tempo_var_score +
+            0.10 * zcr_score
+        )
+        self._cache_time[key] = value
+        return value
 
-        attack_time_score = safe_clip01(attack_time/(attack_time + 0.05))
-        attack_slope_score = safe_clip01(1.0/(1.0 + abs(attack_slope)/50.0))
-        decay_slope_score = safe_clip01(1.0/(1.0 + abs(decay_slope)/50.0))
+    def _time_instrumentalness_evidence(self) -> float:
+        """
+        Return weak time-domain non-vocal evidence in [0, 1].
 
-        transient_score = safe_clip01(1.0 - transient_rate/(transient_rate + 3.0))
-        zcr_score = safe_clip01(1.0 - zcr_var/(1.0 + zcr_var))
-
-        w_nv = 0.22
-        w_sm = 0.20
-        w_ss = 0.16
-        w_ats = 0.14
-        w_ass = 0.10
-        w_dss = 0.08
-        w_ts = 0.05
-        w_zcr = 0.05
-
-        val = (w_nv*nonvocal_score + w_sm*smoothness + w_ss*silence_score + w_ats*attack_time_score + + w_ass*attack_slope_score + w_dss*decay_slope_score + w_ts*transient_score + w_zcr*zcr_score)
-
-        val = safe_clip01(val)
-        self._cache_time[key] = val
-        return val
-
-    def _spotify_time_signature(self) -> int:
-        key = "spotify_time_signature"
+        This is only a prior. Harmonicity is not treated as proof of
+        instrumental content because vocals can also be strongly harmonic.
+        """
+        key = "time_instrumentalness_evidence"
         if key in self._cache_time:
             return self._cache_time[key]
 
         if getattr(self, "invalid", False):
-            self._cache_time[key] = 4
-            return 4
-        
-        periodicity = self._beat_periodicity_entropy()
-        ac = self._onset_autocorrelation()
-        if ac.size < 3:
-            self._cache_time[key] = 4
-            return 4
-        
-        fs_env = self.sr/float(self.H)
-        candidate_meters = [3, 4]
+            self._cache_time[key] = 0.0
+            return 0.0
+
+        mask = self._active_rms_mask(db_threshold=-60.0)
+        if mask.size == 0 or not np.any(mask):
+            self._cache_time[key] = 0.0
+            return 0.0
+
+        speech_proxy = self._time_speechiness_evidence()
+        harmonic_ratio = self._harmonic_ratio()
+        transient_rate = self._transient_rate()
+        zcr_disp = self._zcr_iqr_ratio()
+
+        non_speech = safe_clip01(1.0 - speech_proxy)
+        stable_timbre = safe_clip01(1.0 - zcr_disp / (1.0 + zcr_disp))
+        harmonicity = safe_clip01(harmonic_ratio)
+        sparse_transients = safe_clip01(
+            1.0 - transient_rate / (transient_rate + 6.0)
+        )
+
+        value = safe_clip01(
+            0.45 * non_speech +
+            0.20 * stable_timbre +
+            0.20 * harmonicity +
+            0.15 * sparse_transients
+        )
+        self._cache_time[key] = value
+        return value
+
+    def _time_signature_evidence(
+        self,
+        tempo_bpm: float | None = None,
+    ) -> dict:
+        """
+        Estimate meter evidence from beat-synchronous onset structure.
+
+        Returns a candidate meter plus confidence. A fallback of 4 is retained
+        for API compatibility, but its confidence is zero when the evidence is
+        insufficient, so the fusion layer can ignore it.
+        """
+        key = f"time_signature_evidence_{tempo_bpm}"
+        if key in self._cache_time:
+            return self._cache_time[key]
+
+        neutral = {
+            "time_signature": 4,
+            "confidence": 0.0,
+            "scores": {},
+        }
+
+        if getattr(self, "invalid", False):
+            self._cache_time[key] = neutral
+            return neutral
+
+        if tempo_bpm is None or tempo_bpm <= 0.0:
+            tempo_bpm = self._time_tempo_bpm()
+        if tempo_bpm <= 0.0:
+            self._cache_time[key] = neutral
+            return neutral
+
+        onset_env = self._onset_envelope()["onset_env"]
+        if onset_env.size < 8:
+            self._cache_time[key] = neutral
+            return neutral
+
+        fs_env = self.sr / float(self.H)
+        beat_lag = 60.0 * fs_env / float(tempo_bpm)
+        if beat_lag < 1.0:
+            self._cache_time[key] = neutral
+            return neutral
+
+        beat_positions = np.arange(0.0, len(onset_env), beat_lag)
+        beat_strength = np.interp(
+            beat_positions,
+            np.arange(len(onset_env)),
+            onset_env,
+        )
+        if beat_strength.size < 12:
+            self._cache_time[key] = neutral
+            return neutral
+
+        beat_strength = beat_strength.astype(float)
+        q10, q90 = np.percentile(beat_strength, [10.0, 90.0])
+        scale = float(q90 - q10)
+        if scale > EPS:
+            beat_strength = (beat_strength - q10) / scale
+        else:
+            beat_strength = np.zeros_like(beat_strength)
+
         scores = {}
+        for meter in range(3, 8):
+            n_measures = beat_strength.size // meter
+            if n_measures < 4:
+                scores[meter] = 0.0
+                continue
 
-        for meter in candidate_meters:
-            if meter == 3:
-                lag_targets = [int(round(fs_env*0.5)), int(round(fs_env*1.0)), int(round(fs_env*1.5))]
-            else:
-                lag_targets = [int(round(fs_env*0.5)), int(round(fs_env*1.0)), int(round(fs_env*2.0))]
+            usable = beat_strength[:n_measures * meter].reshape(n_measures, meter)
 
-            vals = []
-            for lag in lag_targets:
-                if 1 <= lag < ac.size:
-                    vals.append(ac[lag])
-            scores[meter] = float(float(np.mean(vals)) if vals else 0.0)
+            centered = usable - usable.mean(axis=1, keepdims=True)
+            numer = float(np.sum(centered[:-1] * centered[1:]))
+            denom = float(
+                np.sqrt(
+                    np.sum(centered[:-1] ** 2) *
+                    np.sum(centered[1:] ** 2)
+                ) + EPS
+            )
+            pattern_repeat = float(np.clip(numer / denom, -1.0, 1.0))
+            pattern_repeat = safe_clip01((pattern_repeat + 1.0) / 2.0)
 
-        meter = max(scores, key=scores.get)
-        if periodicity < 0.15:
+            phase_scores = []
+            for phase in range(meter):
+                rotated = np.roll(usable, -phase, axis=1)
+                first = float(np.mean(rotated[:, 0]))
+                rest = float(np.mean(rotated[:, 1:])) if meter > 1 else 0.0
+                accent_ratio = (first - rest) / (first + rest + EPS)
+                phase_scores.append(safe_clip01(accent_ratio))
+
+            accent_score = max(phase_scores) if phase_scores else 0.5
+            scores[meter] = 0.75 * pattern_repeat + 0.25 * accent_score
+
+        finite_scores = {
+            meter: score
+            for meter, score in scores.items()
+            if np.isfinite(score)
+        }
+        if not finite_scores:
+            self._cache_time[key] = neutral
+            return neutral
+
+        ranked = sorted(
+            finite_scores.items(),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+        best_meter, best_score = ranked[0]
+        second_score = ranked[1][1] if len(ranked) > 1 else 0.0
+        score4 = float(finite_scores.get(4, 0.0))
+
+        # Preserve the existing conservative preference for 4/4 when the
+        # candidates are nearly tied, but make that uncertainty explicit.
+        if best_meter != 4 and best_score - score4 < 0.05:
             meter = 4
+            separation = max(0.0, score4 - second_score)
+        else:
+            meter = int(best_meter)
+            separation = max(0.0, best_score - second_score)
 
-        self._cache_time[key] = meter
-        return meter
-    
-    def spotify_audio_features(self, weights=None) -> dict:
-        loudness = self._spotify_loudness(active_only=True)
-        energy = self._spotify_energy(active_only=True)
-        speechiness = self._spotify_speechiness()
-        acousticness = self._spotify_acousticness()
-        danceability = self._spotify_danceability()
-        tempo = self._spotify_tempo()
-        liveness = self._spotify_liveness()
-        instrumentalness = self._spotify_instrumentalness()
-        time_signature = self._spotify_time_signature()
+        structure_strength = safe_clip01(float(best_score))
+        separation_conf = safe_clip01(
+            separation / (abs(float(best_score)) + EPS)
+        )
+        sample_conf = safe_clip01(
+            beat_strength.size / max(16.0, 16.0 * 8.0)
+        )
+        confidence = safe_clip01(
+            0.50 * structure_strength +
+            0.35 * separation_conf +
+            0.15 * sample_conf
+        )
 
-        loudness_score = safe_clip01((loudness + 60.0) / 60.0)
-        energy_score = safe_clip01(energy / (energy + 0.01))
-        tempo_score = safe_clip01(tempo / 200.0)
-        time_signature_score = 1.0 if time_signature == 4 else 0.5 if time_signature == 3 else 0.0
+        result = {
+            "time_signature": meter,
+            "confidence": float(confidence),
+            "scores": {int(k): float(v) for k, v in finite_scores.items()},
+        }
+        self._cache_time[key] = result
+        return result
 
-        vals = np.array([
-            loudness_score,
-            energy_score,
-            speechiness,
-            acousticness,
-            danceability,
-            tempo_score,
-            liveness,
-            instrumentalness,
-            time_signature_score,
-        ], dtype=float)
+    def time_domain_evidence(self) -> dict:
+        """
+        Return time-domain evidence for central cross-domain fusion.
 
-        if weights is None:
-            weights = np.array([
-                0.14,
-                0.14,
-                0.11,
-                0.11,
-                0.16,
-                0.13,
-                0.08,
-                0.09,
-                0.04,
-            ], dtype=float)
-
-        weights = np.asarray(weights, dtype=float)
-        if weights.size != vals.size:
-            raise ValueError(f"weights must have length {vals.size}, got {weights.size}")
-
-        fused = float(np.sum(vals * weights) / (np.sum(weights) + EPS))
+        Keys are explicitly domain-scoped. They are not claims of Spotify's
+        proprietary Audio Features values.
+        """
+        tempo = self._time_tempo_bpm()
+        tempo_confidence = self._time_tempo_confidence(tempo_bpm=tempo)
+        time_signature = self._time_signature_evidence(tempo_bpm=tempo)
 
         return {
-            "loudness_db": loudness,
-            "energy": energy,
-            "speechiness": speechiness,
-            "acousticness": acousticness,
-            "danceability": danceability,
-            "tempo_bpm": tempo,
-            "liveness": liveness,
-            "instrumentalness": instrumentalness,
-            "time_signature": time_signature,
-            "spotify_fused": safe_clip01(fused),
+            "loudness_db_time": self._time_loudness_db(active_only=True),
+            "energy_time": self._time_energy(active_only=True),
+            "speechiness_time": self._time_speechiness_evidence(),
+            "acousticness_time": self._time_acousticness_evidence(),
+            "danceability_time": self._time_danceability_evidence(tempo_bpm=tempo),
+            "tempo_time_bpm": tempo,
+            "tempo_confidence_time": tempo_confidence,
+            "performance_variability_time": self._time_performance_variability(),
+            "instrumentalness_time": self._time_instrumentalness_evidence(),
+            "time_signature_time": int(time_signature["time_signature"]),
+            "time_signature_confidence_time": float(time_signature["confidence"]),
         }
+
+    def time_domain_spotify_features(self) -> dict:
+        """
+        Backward-compatible public alias.
+
+        The returned values are still domain-specific evidence and must be
+        fused centrally before producing a final Spotify-style feature vector.
+        """
+        return self.time_domain_evidence()
+
+    def spotify_audio_features(self, weights=None) -> dict:
+        """
+        Backward-compatible alias for callers using the previous API.
+
+        ``weights`` is intentionally ignored. Cross-domain weighting belongs in
+        the central fusion layer.
+        """
+        del weights
+        return self.time_domain_evidence()
+
+    # Backward-compatible method aliases. These retain the old callable API
+    # while making the implementation semantics explicit above.
+    def _spotify_loudness(self, active_only: bool = True) -> float:
+        return self._time_loudness_db(active_only=active_only)
+
+    def _spotify_energy(self, active_only: bool = True) -> float:
+        return self._time_energy(active_only=active_only)
+
+    def _spotify_speechiness(self) -> float:
+        return self._time_speechiness_evidence()
+
+    def _spotify_acousticness(self) -> float:
+        return self._time_acousticness_evidence()
+
+    def _spotify_danceability(self) -> float:
+        tempo = self._time_tempo_bpm()
+        return self._time_danceability_evidence(tempo_bpm=tempo)
+
+    def _spotify_tempo(self) -> float:
+        return self._time_tempo_bpm()
+
+    def _spotify_liveness(self) -> float:
+        return self._time_performance_variability()
+
+    def _spotify_instrumentalness(self) -> float:
+        return self._time_instrumentalness_evidence()
+
+    def _spotify_time_signature(self, tempo_bpm: float | None = None) -> int:
+        return int(self._time_signature_evidence(tempo_bpm=tempo_bpm)["time_signature"])
+

@@ -51,33 +51,34 @@ class TempogramFeatures:
             hop_length=self.H
         )
         beat_times = librosa.frames_to_time(beat_frames, sr=self.sr, hop_length=self.H)
+        self.beat_times = beat_times
+        self.beat_frames = beat_frames
+        self._cache_tempogram["beat_times"] = beat_times
+        self._cache_tempogram["beat_frames"] = beat_frames
         return beat_times, beat_frames
 
-    def _apply_tempo_prior(self, bpms, strengths, mu=115.0, sigma=35.0):
+    def _apply_tempo_prior(self, bpms, strengths, mu=None, sigma=None):
         """
-        Applies a Gaussian log-prior centered around nominal tempo (115 BPM) 
-        to smooth raw tempogram strengths before argmax peak selection.
+        Deprecated compatibility helper.
+
+        Tempo selection is intentionally data-driven in this implementation;
+        no fixed preferred BPM is applied.  If callers explicitly provide a
+        prior center and width, the prior is applied as a soft weighting only.
         """
         bpms = np.asarray(bpms, dtype=float)
         strengths = np.asarray(strengths, dtype=float)
 
-        # Empty or size mismatch guard
         if bpms.size == 0 or strengths.size == 0 or bpms.shape != strengths.shape:
             return np.array([], dtype=float)
-
-        # If all strengths are non-finite, return zeros to avoid NaNs
         if not np.any(np.isfinite(strengths)):
             return np.zeros_like(strengths, dtype=float)
 
-        # Gaussian weightng curve centered at 115.0 BPM
-        prior = np.exp(-0.5*((bpms - mu)/sigma)**2)
-        weighted_strengths = strengths*prior
+        out = np.nan_to_num(strengths, nan=0.0, posinf=0.0, neginf=0.0).copy()
+        if mu is None or sigma is None or sigma <= 0:
+            return out
 
-        # Heavily penalize extreme boundary candidates (< 60 BPM or > 190 BPM)
-        extreme_mask = (bpms < 60.0) | (bpms > 190.0)
-        weighted_strengths[extreme_mask] *= 0.15
-
-        return weighted_strengths
+        prior = np.exp(-0.5 * ((bpms - float(mu)) / float(sigma)) ** 2)
+        return out * prior
 
     def _correct_octave_dips(
         self,
@@ -456,10 +457,7 @@ class TempogramFeatures:
             x = x - np.mean(x)
             acf = np.correlate(x, x, mode='full')[len(x) - 1:]
 
-            if norm_sum:
-                acf = acf/(np.sum(acf) + EPS)
-            else:
-                acf = acf/(acf[0] + EPS)
+            acf = acf/(acf[0] + EPS)
 
             tempogram[:min(win_length, len(acf)), n] = acf[:win_length]
 
@@ -547,34 +545,63 @@ class TempogramFeatures:
             self._cache_tempogram[key] = result
             return result
 
-        # Stage 1: Prior-weighted candidate selection
-        weighted_strengths = self._apply_tempo_prior(
-            search_bpms, search_strengths, mu=115.0, sigma=35.0
-        )
-
-        # Guard: if prior returns empty or all non-finite, fall back to raw strengths
-        if weighted_strengths is None or weighted_strengths.size == 0 or not np.any(np.isfinite(weighted_strengths)):
-            weighted_strengths = search_strengths.copy()
-
-        best_rel = int(np.argmax(weighted_strengths))
+        # 1. Find the primary peak index (no prior weighting, no octave correction)
+        best_rel   = int(np.argmax(search_strengths))
         primary_idx = int(idxs[best_rel])
 
-        # Stage 2: Asymmetric Octave Dip/Peak Guard
-        octave_result = self._correct_octave_dips(
-            primary_idx, bpm, global_ac, bpm_min=bpm_min, bpm_max=bpm_max
-        )
+        # 2. Parabolic interpolation for sub-integer lag precision
+        #    Refines the lag to a fractional value before converting to BPM,
+        #    eliminating the quantisation error from integer FFT lags.
+        refined_bpm = float(bpm[primary_idx])    # fallback to grid value
 
-        if octave_result is None:
-            final_idx, final_bpm, final_strength = primary_idx, float(bpm[primary_idx]), float(global_ac[primary_idx])
+        if 0 < primary_idx < len(global_ac) - 1:
+            y0 = global_ac[primary_idx - 1]
+            y1 = global_ac[primary_idx]
+            y2 = global_ac[primary_idx + 1]
+            denom = 2.0 * y1 - y0 - y2
+            if abs(denom) > EPS:
+                delta = 0.5 * (y0 - y2) / denom        # sub-sample offset in [-0.5, 0.5]
+                refined_lag = primary_idx + delta
+                if refined_lag > 0:
+                    candidate = 60.0 * self.frame_rate / refined_lag
+                    if bpm_min <= candidate <= bpm_max:
+                        refined_bpm = float(candidate)
+
+        primary_bpm      = refined_bpm
+        primary_strength = float(global_ac[primary_idx])
+
+        # 3. Find secondary peak — different from primary by at least 20% BPM
+        #    Gives the caller visibility into alternative tempo candidates
+        #    without forcing an octave correction internally.
+        secondary_bpm      = 0.0
+        secondary_strength = 0.0
+
+        sorted_rel = np.argsort(search_strengths)[::-1]
+        for rel in sorted_rel[1:]:
+            candidate_bpm = float(search_bpms[rel])
+            if abs(candidate_bpm - primary_bpm) / (primary_bpm + EPS) > 0.20:
+                secondary_bpm      = candidate_bpm
+                secondary_strength = float(search_strengths[rel])
+                break
+
+        # 4. Confidence: how far primary is above the secondary candidate
+        if secondary_strength > EPS:
+            confidence = float(np.clip(
+                (primary_strength - secondary_strength) / (primary_strength + EPS),
+                0.0, 1.0
+            ))
         else:
-            final_idx, final_bpm, final_strength = octave_result
+            confidence = 1.0
 
         result = {
-            "bpm": float(final_bpm),
-            "lag": int(final_idx),
-            "strength": float(final_strength),
-            "bpm_axis": bpm,
-            "global_ac": global_ac
+            "bpm":                primary_bpm,       # interpolated, no prior, no octave forcing
+            "lag":                int(primary_idx),   # original integer lag index
+            "strength":           primary_strength,
+            "confidence":         confidence,
+            "secondary_bpm":      secondary_bpm,
+            "secondary_strength": secondary_strength,
+            "bpm_axis":           bpm,
+            "global_ac":          global_ac,
         }
 
         self._cache_tempogram[key] = result
@@ -609,11 +636,33 @@ class TempogramFeatures:
             return result
         
         idxs = np.where(mask)[0]
-        local_slice = tg[mask, :]
-        best_rel = np.argmax(local_slice, axis=0)
-        best_idx = idxs[best_rel]
-        bpm_curve = bpm_axis[best_idx]
-        strength_curve = local_slice[best_rel, np.arange(local_slice.shape[1])]
+        local_slice = tg[mask, :]          # shape (n_bpms_in_range, n_windows)
+        n_bpms, n_windows = local_slice.shape
+
+        if n_windows == 0 or n_bpms == 0:
+            bpm_curve      = np.array([], dtype=float)
+            strength_curve = np.array([], dtype=float)
+        else:
+            # Viterbi-style: penalise octave jumps between adjacent windows
+            # Transition cost between BPM bins i and j proportional to |log2(bpm_i/bpm_j)|
+            bpms_in_range = bpm_axis[idxs]
+
+            # Greedy forward pass with continuity penalty (faster than full Viterbi)
+            JUMP_PENALTY = 0.3   # fraction of strength subtracted per octave of jump
+            chosen = np.zeros(n_windows, dtype=int)
+            chosen[0] = int(np.argmax(local_slice[:, 0]))
+
+            for t in range(1, n_windows):
+                prev_bpm = bpms_in_range[chosen[t - 1]]
+                scores = local_slice[:, t].copy()
+                for b, bpm_b in enumerate(bpms_in_range):
+                    octave_dist = abs(np.log2((bpm_b + EPS) / (prev_bpm + EPS)))
+                    scores[b] -= JUMP_PENALTY * octave_dist
+                chosen[t] = int(np.argmax(scores))
+
+            best_idx       = idxs[chosen]
+            bpm_curve      = bpm_axis[best_idx]
+            strength_curve = local_slice[chosen, np.arange(n_windows)]
 
         result = {
             "bpm_curve": bpm_curve.astype(float),
@@ -657,24 +706,28 @@ class TempogramFeatures:
 
         vals = np.mean(tg[mask, :], axis=1)
 
-        if vals.size == 0:
-            clarity = 0.0
-            best = 0.0
+        if vals.size < 3:
+            best   = float(np.max(vals)) if vals.size else 0.0
             second = 0.0
-        elif vals.size == 1:
-            vals_normalized = vals / (np.max(vals) + EPS)
-            best = float(vals_normalized[0])
-            second = 0.0
-            clarity = 1.0  # Or a specific logic for single-peak signals
+            clarity = best   # no prominence possible with < 3 points
         else:
-            vals_normalized = vals / (np.max(vals) + EPS)
-            s = np.sort(vals_normalized)
-            best = float(s[-1])
-            second = float(s[-2])
-            clarity = (best - second) / (best + EPS)
+            peaks, props = find_peaks(vals, prominence=0.0)
+            if peaks.size > 0:
+                prominences = props["prominences"]
+                best_peak_idx = peaks[np.argmax(prominences)]
+                best   = float(vals[best_peak_idx])
+                margin = float(np.max(prominences))
+                # Clarity = absolute strength × normalised prominence
+                clarity = float(best * np.clip(margin / (best + EPS), 0.0, 1.0))
+                second = float(vals[peaks[np.argsort(prominences)[-2]]]) if peaks.size > 1 else 0.0
+            else:
+                # No prominent peaks — flat or noisy signal
+                best   = float(np.max(vals))
+                second = float(np.sort(vals)[-2]) if vals.size > 1 else 0.0
+                clarity = 0.0
 
         result = {
-            "clarity": safe_clip01(clarity),
+            "clarity":   safe_clip01(clarity),
             "best_peak": best,
             "runner_up": second
         }
@@ -707,8 +760,8 @@ class TempogramFeatures:
         curve = self._local_bpm_curve(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum)["bpm_curve"]
         if curve.size < 2:
             result = {
-                "stability": 1.0,
-                "mean_bpm": 0.0,
+                "stability": 0.0,
+                "mean_bpm": float(np.mean(curve)) if curve.size else 0.0,
                 "std_bpm": 0.0
             }
 
@@ -747,33 +800,54 @@ class TempogramFeatures:
             return result
         
         variation = l["bpm_curve"] - g["bpm"]
+        abs_var = np.abs(variation)
         result = {
-            "curve": np.abs(variation).astype(float),
-            "variation": variation.astype(float),
-            "abs_variation": np.abs(variation).astype(float),
-            "times": l["times"]
+            "curve":         abs_var.astype(float),
+            "variation":     variation.astype(float),
+            "abs_variation": abs_var.astype(float),
+            "times":         l["times"],
+            "mean":          float(np.mean(abs_var))   if abs_var.size else 0.0,
+            "std":           float(np.std(abs_var))    if abs_var.size else 0.0,
+            "max":           float(np.max(abs_var))    if abs_var.size else 0.0,
+            "p95":           float(np.percentile(abs_var, 95)) if abs_var.size else 0.0,
         }
 
         self._cache_tempogram[key] = result
         return result
     
-    def _beat_fluctuation_rate(self, bpm_min=40.0, bpm_max=240.0, norm_sum=True):
-        key = f"beat_fluctuation_rate_{bpm_min}_{bpm_max}_{norm_sum}"
+    def _beat_fluctuation_density(self, bpm_min=40.0, bpm_max=240.0, norm_sum=True):
+        """
+        Renamed from _beat_fluctuation_rate.
+        Returns mean absolute BPM change per second (a true rate).
+        """
+        key = f"beat_fluctuation_density_{bpm_min}_{bpm_max}_{norm_sum}"
         if key in self._cache_tempogram:
             return self._cache_tempogram[key]
-        
-        curve = self._local_bpm_curve(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum)["bpm_curve"]
+
+        curve_res = self._local_bpm_curve(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum)
+        curve = curve_res["bpm_curve"]
         if curve.size < 2:
             self._cache_tempogram[key] = 0.0
             return 0.0
-        
-        rate = float(np.mean(np.abs(np.diff(curve))))
+
+        # Mean absolute change per frame, divided by hop duration → change per second
+        hop_sec = self.H / float(self.sr)
+        rate = float(np.mean(np.abs(np.diff(curve))) / hop_sec)
 
         self._cache_tempogram[key] = rate
         return rate
+
+    def _beat_fluctuation_rate(self, bpm_min=40.0, bpm_max=240.0, norm_sum=True):
+        """Deprecated: use _beat_fluctuation_density (true rate per second)."""
+        return self._beat_fluctuation_density(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum)
     
-    def _multi_periodic_structure(self, bpm_min=40.0, bpm_max=240.0, norm_sum=True):
-        key = f"multi_periodic_structure_{bpm_min}_{bpm_max}_{norm_sum}"
+    def _tempo_harmonicity(self, bpm_min=40.0, bpm_max=240.0, norm_sum=True):
+        """
+        Renamed from _multi_periodic_structure.
+        Measures energy at beat-harmonic periods (half and double the primary BPM)
+        relative to the primary. High score = rich sub/super-beat structure.
+        """
+        key = f"tempo_harmonicity_{bpm_min}_{bpm_max}_{norm_sum}"
         if key in self._cache_tempogram:
             return self._cache_tempogram[key]
         
@@ -814,20 +888,35 @@ class TempogramFeatures:
         score = (half_score + double_score)/(primary_score + EPS)
 
         result = {
-            "score": float(np.clip(score, 0.0, 2.0)),
-            "primary_bpm": primary_bpm,
-            "half_bpm": half_bpm_near,
-            "double_bpm": double_bpm_near,
-            "primary_score": primary_score,
-            "half_score": half_score,
-            "double_score": double_score
+            "harmonicity_score": float(np.clip(score, 0.0, 2.0)),  # was "score"
+            "score":             float(np.clip(score, 0.0, 2.0)),  # keep for compatibility
+            "primary_bpm":       primary_bpm,
+            "half_bpm":          half_bpm_near,
+            "double_bpm":        double_bpm_near,
+            "primary_strength":  primary_score,   # was "primary_score"
+            "half_strength":     half_score,      # was "half_score"
+            "double_strength":   double_score,    # was "double_score"
+            # Keep old names too for backwards compat:
+            "primary_score":     primary_score,
+            "half_score":        half_score,
+            "double_score":      double_score,
         }
 
         self._cache_tempogram[key] = result
         return result
+
+    def _multi_periodic_structure(self, bpm_min=40.0, bpm_max=240.0, norm_sum=True):
+        """Deprecated alias for _tempo_harmonicity."""
+        return self._tempo_harmonicity(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum)
     
-    def _swing_ratio(self, bpm_min=40.0, bpm_max=240.0, norm_sum=True):
-        key = f"swing_ratio_{bpm_min}_{bpm_max}_{norm_sum}"
+    def _tempo_harmonic_ratio(self, bpm_min=40.0, bpm_max=240.0, norm_sum=True):
+        """
+        Renamed from _swing_ratio.
+        This measures the ratio of energy at double-BPM vs half-BPM lags in
+        the autocorrelation — not musical swing (which requires sub-beat timing).
+        Rename communicates what it actually measures.
+        """
+        key = f"tempo_harmonic_ratio_{bpm_min}_{bpm_max}_{norm_sum}"
         if key in self._cache_tempogram:
             return self._cache_tempogram[key]
         
@@ -870,15 +959,19 @@ class TempogramFeatures:
         symmetry = safe_clip01(symmetry)
 
         result = {
-            "ratio": float(ratio),
-            "symmetry": symmetry,
+            "ratio":       float(ratio),
+            "symmetry":    symmetry,
             "primary_bpm": float(bpm_axis[best_idx]),
-            "half_bpm": float(bpm_axis[half_idx]),
-            "double_bpm": float(bpm_axis[double_idx])
+            "half_bpm":    float(bpm_axis[half_idx]),
+            "double_bpm":  float(bpm_axis[double_idx]),
         }
 
         self._cache_tempogram[key] = result
         return result 
+
+    def _swing_ratio(self, bpm_min=40.0, bpm_max=240.0, norm_sum=True):
+        """Deprecated alias for _tempo_harmonic_ratio."""
+        return self._tempo_harmonic_ratio(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum)
     
     # Fourier Tempogram
     # def _tempogram_fourier(self, win_length=None, center=None, window='hann'):
@@ -1428,14 +1521,15 @@ class TempogramFeatures:
             - "fractional": fractional position relative to the median beat period (can be >1)
             - "nearest": signed phase offset to the nearest beat (in beat-phase units)
         """
-        has_custom_beats = (beat_times is not None) or (beat_frames is not None)
-        key = f"bat_position_{mode}"
-        if not has_custom_beats and key in self._cache_tempogram:
+        key = f"beat_position_{mode}"
+        if key in self._cache_tempogram:
             return self._cache_tempogram[key]
-
+        
+        # 1. Onset times
         onset = self._onset_strength()
         t = onset["times"]
 
+        # 2. Resolve beat timing sources
         if beat_times is None and beat_frames is None:
             beat_times, beat_frames = self._get_default_beats()
 
@@ -1447,57 +1541,45 @@ class TempogramFeatures:
             result = {
                 "beat_position": np.array([], dtype=float),
                 "beat_index": np.array([], dtype=int),
-                "beat_period": 0.0
+                "beat_period": 0.0,
             }
-            if not has_custom_beats:
-                self._cache_tempogram[key] = result
+            self._cache_tempogram[key] = result
             return result
 
+        # Median beat period
         beat_period = float(self._beat_period_from_beats(beat_times))
 
+        # 3. For each onset time, find the beat interval
         idx = np.searchsorted(beat_times, t, side="right") - 1
+        idx = np.clip(idx, 0, beat_times.size - 2)
 
-        idx_clamped = np.clip(idx, 0, beat_times.size - 2)
-        t_start = beat_times[idx_clamped]
-
-        # For frames beyond the last beat, extrapolate using the last IBI
-        last_ibi = beat_times[-1] - beat_times[-2] if beat_times.size >= 2 else (self.H/float(self.sr))
-        t_end_extrap = np.where(
-            idx_clamped < beat_times.size - 1,
-            beat_times[idx_clamped + 1],
-            beat_times[idx_clamped] + last_ibi
-        )
-        dt = t_end_extrap - t_start
+        # Local interval [beat_times[idx], beat_times[idx + 1]]
+        dt = beat_times[idx + 1] - beat_times[idx]
         dt[dt <= 0] = EPS
 
-        phase = (t - t_start)/dt
-        phase = np.clip(phase, 0.0, 1.0)
+        # Phase within current interval
+        phase = (t - beat_times[idx])/dt
+        phase = np.mod(phase, 1.0)
 
-        # Only mask frames that fall before the first beat
-        valid_mask = idx >= 0
-        phase[~valid_mask] = np.nan
-
+        # 4. Map to requested mode
         if mode == "phase":
             pos = phase
         elif mode == "fractional":
-            pos = (t -t_start)/(beat_period + EPS)
-            pos[~valid_mask] = np.nan
+            # Fractional position relative to median beat period
+            pos = (t - beat_times[idx])/(beat_period + EPS)
         elif mode == "nearest":
-            nearest_beat = np.where(phase > 0.5, t_end_extrap, t_start)
-            pos = (t - nearest_beat)/(beat_period + EPS)
-            pos[~valid_mask] = np.nan
+            # Signed phase offset to current beat, wrapped to [-0.5, 0.5)
+            pos = np.where(phase > 0.5, phase - 1.0, phase)
         else:
             raise ValueError("mode must be 'phase', 'fractional', or 'nearest'")
 
         result = {
             "beat_position": pos.astype(float),
-            "beat_index": np.where(valid_mask, idx, -1).astype(int),
+            "beat_index": idx.astype(int),
             "beat_period": beat_period
         }
 
-        if not has_custom_beats:
-            self._cache_tempogram[key] = result
-
+        self._cache_tempogram[key] = result
         return result
     
     def _beat_alignment_histogram(self, beat_times=None, beat_frames=None, n_bins=16, normalize=True):
@@ -1531,10 +1613,20 @@ class TempogramFeatures:
 
         peak_bin = int(np.argmax(hist)) if hist.size > 0 else -1
 
+        if hist.size > 0 and np.sum(hist) > EPS:
+            p = hist / (np.sum(hist) + EPS)
+            entropy = float(-np.sum(p * np.log2(p + EPS)) / np.log2(n_bins))  # normalised [0,1]
+            concentration = float(np.max(p))                                    # peak bin fraction
+        else:
+            entropy       = 1.0   # maximum uncertainty
+            concentration = 0.0
+
         result = {
-            "histogram": hist,
-            "bins": bins,
-            "peak_bin": peak_bin
+            "histogram":     hist,
+            "bins":          bins,
+            "peak_bin":      peak_bin,
+            "entropy":       entropy,       # 1.0 = flat/random, 0.0 = all events on one beat
+            "concentration": concentration, # fraction of events at the dominant beat phase
         }
 
         self._cache_tempogram[key] = result
@@ -1563,14 +1655,18 @@ class TempogramFeatures:
             return 0.0
         
         ibi = np.diff(beat_times)
-        var = float(np.var(ibi, ddof=1)) if ibi.size > 1 else 0.0
+        if ibi.size < 2:
+            self._cache_tempogram[key] = 0.0
+            return 0.0
 
-        if normalize:
-            mean_ibi = float(np.mean(ibi))
-            var /= (mean_ibi**2 + EPS)
+        var     = float(np.var(ibi, ddof=1))
+        mean_ibi = float(np.mean(ibi))
+        cv      = float(np.std(ibi, ddof=1) / (mean_ibi + EPS))   # coefficient of variation
 
-        self._cache_tempogram[key] = var
-        return var
+        # normalize=True now returns CV (dimensionless, interpretable across tempos)
+        result_val = cv if normalize else var
+        self._cache_tempogram[key] = result_val
+        return result_val
     
     def _beat_sync_offset(self, beat_times=None, beat_frames=None, event_times=None, event_frames=None, absolute=True):
         """
@@ -1606,12 +1702,23 @@ class TempogramFeatures:
             self._cache_tempogram[key] = result
             return result
         
-        idx = np.searchsorted(beat_times, event_times, side="right") - 1
-        idx = np.clip(idx, 0, beat_times.size - 2)
+        idx_before = np.searchsorted(beat_times, event_times, side="right") - 1
+        idx_before = np.clip(idx_before, 0, beat_times.size - 1)
+        idx_after  = np.clip(idx_before + 1, 0, beat_times.size - 1)
 
-        ibi = beat_times[idx + 1] - beat_times[idx]
-        offset = event_times - beat_times[idx]
-        offset_norm = offset/(ibi + EPS)
+        dist_before = np.abs(event_times - beat_times[idx_before])
+        dist_after  = np.abs(event_times - beat_times[idx_after])
+
+        # Pick whichever beat is closer
+        nearest_idx = np.where(dist_before <= dist_after, idx_before, idx_after)
+
+        # Signed offset: positive = event after beat, negative = event before beat
+        offset = event_times - beat_times[nearest_idx]
+
+        # Normalise by local IBI (use preceding interval for the nearest beat)
+        ibi_idx = np.clip(nearest_idx, 0, beat_times.size - 2)
+        ibi = beat_times[ibi_idx + 1] - beat_times[ibi_idx]
+        offset_norm = offset / (ibi + EPS)
 
         if absolute:
             summary = float(np.mean(np.abs(offset)))
@@ -1632,8 +1739,9 @@ class TempogramFeatures:
         self._cache_tempogram[key] = result
         return result
     
-    # Spotify-based Tempogram features
+    # Rhythm-domain feature evidence
     def _beat_periodic_energy(self, bpm_min=40.0, bpm_max=240.0, norm_sum=True):
+        """Return the Fourier-tempo energy distribution in the requested BPM range."""
         key = f"beat_periodic_energy_{bpm_min}_{bpm_max}_{norm_sum}"
         if key in self._cache_tempogram:
             return self._cache_tempogram[key]
@@ -1652,10 +1760,11 @@ class TempogramFeatures:
         return out
 
     def _loudness_tempogram_per_beat(self, beat_times=None, beat_frames=None):
+        """Average onset strength around each beat; rhythm/transient evidence, not LUFS."""
         key = f"loudness_tempogram_per_beat_{beat_times is not None}_{beat_frames is not None}"
         if key in self._cache_tempogram:
             return self._cache_tempogram[key]
-        
+
         onset = self._onset_strength()
         env = onset["onset_env"]
         times = onset["times"]
@@ -1667,7 +1776,7 @@ class TempogramFeatures:
                     out = np.array([], dtype=float)
                     self._cache_tempogram[key] = out
                     return out
-                beat_period = 60.0/g["bpm"]
+                beat_period = 60.0 / g["bpm"]
                 beat_times = np.arange(times[0], times[-1] + beat_period, beat_period)
             else:
                 beat_times = self._beat_time_from_frames(beat_frames)
@@ -1679,12 +1788,14 @@ class TempogramFeatures:
             return out
 
         vals = np.zeros(beat_times.size, dtype=float)
-        half_win = 0.5*(np.median(np.diff(beat_times)) if beat_times.size > 1 else (self.H/float(self.sr)))
+        half_win = 0.5 * (
+            np.median(np.diff(beat_times)) if beat_times.size > 1 else self.H / float(self.sr)
+        )
 
         for i, bt in enumerate(beat_times):
             lo = bt - half_win
             hi = bt + half_win
-            mask = (times >= lo) & (times< hi)
+            mask = (times >= lo) & (times < hi)
             if np.any(mask):
                 vals[i] = float(np.mean(env[mask]))
             else:
@@ -1694,154 +1805,332 @@ class TempogramFeatures:
         self._cache_tempogram[key] = vals
         return vals
 
-    def _danceability_tempogram(self, bpm_min=40.0, bpm_max=240.0, norm_sum=True):
-        key = f"danceability_tempogram_{bpm_min}_{bpm_max}_{norm_sum}"
+    def _rhythmic_drive(self, bpm_min=40.0, bpm_max=240.0, norm_sum=True):
+        """
+        Rhythmic regularity and pulse-strength evidence.
+
+        This is a useful rhythm-domain input for a downstream danceability
+        model, but it is not Spotify's proprietary danceability model.
+        """
+        key = f"rhythmic_drive_{bpm_min}_{bpm_max}_{norm_sum}"
         if key in self._cache_tempogram:
             return self._cache_tempogram[key]
-        
-        pulse = self._pulse_clarity(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum)["clarity"]
-        stab = self._tempo_stability_index(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum)["stability"]
-        beat_strength = self._beat_periodicity_strength(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum)["strength"]
-        multi = self._multi_periodic_structure(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum)["score"]
-        var = self._beat_fluctuation_rate(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum)
+
+        pulse = self._pulse_clarity(
+            bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum
+        )["clarity"]
+        stab = self._tempo_stability_index(
+            bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum
+        )["stability"]
+        beat_strength = self._beat_periodicity_strength(
+            bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum
+        )["strength"]
+        harmonicity = self._tempo_harmonicity(
+            bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum
+        )["harmonicity_score"]
+        var = self._beat_fluctuation_density(
+            bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum
+        )
 
         val = float(np.clip(
-            0.30*pulse +
-            0.25*stab +
-            0.20*beat_strength +
-            0.15*(1.0 - np.tanh(var/10.0)) +
-            0.10*(1.0 - np.clip(multi/2.0, 0.0, 1.0)),
-            0.0, 1.0
+            0.35 * pulse +
+            0.25 * stab +
+            0.20 * beat_strength +
+            0.10 * (1.0 - np.tanh(var / 10.0)) +
+            0.10 * (1.0 - np.clip(harmonicity / 2.0, 0.0, 1.0)),
+            0.0,
+            1.0,
+        ))
+
+        self._cache_tempogram[key] = val
+        return val
+
+    def _danceability_tempogram(self, bpm_min=40.0, bpm_max=240.0, norm_sum=True):
+        """Deprecated compatibility alias for :meth:`_rhythmic_drive`."""
+        return self._rhythmic_drive(
+            bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum
+        )
+
+    def _rhythmic_coherence(self, bpm_min=40.0, bpm_max=240.0, norm_sum=True):
+        """
+        Rhythm coherence evidence.
+
+        This measures temporal/rhythmic organization. It is deliberately not
+        exposed as valence because tempo alone does not identify emotional
+        positivity/negativity.
+        """
+        key = f"rhythmic_coherence_{bpm_min}_{bpm_max}_{norm_sum}"
+        if key in self._cache_tempogram:
+            return self._cache_tempogram[key]
+
+        clarity = self._pulse_clarity(
+            bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum
+        )["clarity"]
+        stab = self._tempo_stability_index(
+            bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum
+        )["stability"]
+        cent = self._tempo_spectral_centroid(
+            bpm_min=bpm_min, bpm_max=bpm_max
+        )["centroid"]
+        bandwidth = self._tempo_bandwidth(
+            bpm_min=bpm_min, bpm_max=bpm_max
+        )["bandwidth"]
+        skew = self._tempo_skewness(
+            bpm_min=bpm_min, bpm_max=bpm_max
+        )["skewness"]
+
+        centroid_score = float(np.clip(
+            (cent - bpm_min) / (bpm_max - bpm_min + EPS), 0.0, 1.0
+        ))
+        spread_score = float(np.clip(
+            1.0 - np.tanh(bandwidth / (0.5 * (bpm_max - bpm_min) + EPS)),
+            0.0,
+            1.0,
+        ))
+        skew_score = float(np.clip(0.5 + 0.25 * np.tanh(skew), 0.0, 1.0))
+
+        val = float(np.clip(
+            0.30 * stab +
+            0.25 * clarity +
+            0.20 * centroid_score +
+            0.15 * spread_score +
+            0.10 * skew_score,
+            0.0,
+            1.0,
         ))
 
         self._cache_tempogram[key] = val
         return val
 
     def _valence_tempogram(self, bpm_min=40.0, bpm_max=240.0, norm_sum=True):
-        key = f"valence_tempogram_{bpm_min}_{bpm_max}_{norm_sum}"
+        """Deprecated compatibility alias for :meth:`_rhythmic_coherence`."""
+        return self._rhythmic_coherence(
+            bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum
+        )
+
+    def _tempo_performance_variability(self, bpm_min=40.0, bpm_max=240.0, norm_sum=True):
+        """
+        Tempo/performance variability evidence.
+
+        This measures tempo fluctuation and beat-timing variability. It is not
+        a detector for audience noise or Spotify's liveness feature.
+        """
+        key = f"tempo_performance_variability_{bpm_min}_{bpm_max}_{norm_sum}"
         if key in self._cache_tempogram:
             return self._cache_tempogram[key]
 
-        clarity = self._pulse_clarity(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum)["clarity"]
-        stab = self._tempo_stability_index(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum)["stability"]
-        cent = self._tempo_spectral_centroid(bpm_min=bpm_min, bpm_max=bpm_max)["centroid"]
-        bandwidth = self._tempo_bandwidth(bpm_min=bpm_min, bpm_max=bpm_max)["bandwidth"]
-        skew = self._tempo_skewness(bpm_min=bpm_min, bpm_max=bpm_max)["skewness"]
+        curve_res = self._tempo_variation_curve(
+            bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum
+        )
+        curve = curve_res["curve"]
+        fluc = self._beat_fluctuation_density(
+            bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum
+        )
 
-        centroid_score = float(np.clip((cent - bpm_min)/(bpm_max - bpm_min), 0.0, 1.0))
-        spread_score = float(np.clip(1.0 - np.tanh(bandwidth/(0.5*(bpm_max - bpm_min) + EPS)), 0.0, 1.0))
-        skew_score = float(np.clip(0.5 + 0.25*np.tanh(skew), 0.0, 1.0))
+        beat_times, beat_frames = self._get_default_beats()
+        ibi_cv = self._interbeat_interval_variance(
+            beat_times=beat_times, beat_frames=beat_frames, normalize=True
+        )
+
+        curve_score = float(np.clip(np.mean(curve) / 20.0, 0.0, 1.0)) if curve.size else 0.0
+        fluc_score = float(np.clip(np.tanh(fluc / 10.0), 0.0, 1.0))
+        ibi_score = float(np.clip(np.tanh(ibi_cv), 0.0, 1.0))
 
         val = float(np.clip(
-            0.30*stab + 
-            0.25*clarity + 
-            0.20*centroid_score + 
-            0.15*spread_score +
-            0.10*skew_score,
-            0.0, 1.0
+            0.40 * curve_score +
+            0.35 * fluc_score +
+            0.25 * ibi_score,
+            0.0,
+            1.0,
         ))
 
         self._cache_tempogram[key] = val
         return val
 
     def _liveness_tempogram(self, bpm_min=40.0, bpm_max=240.0, norm_sum=True):
-        key = f"liveness_tempogram_{bpm_min}_{bpm_max}_{norm_sum}"
-        if key in self._cache_tempogram:
-            return self._cache_tempogram[key]
-        
-        curve = self._tempo_variation_curve(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum)["curve"]
-        fluc = self._beat_fluctuation_rate(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum)
-        ibi_var = 0.0
-        if "beat_times" in self._cache_tempogram:
-            ibi_var = self._interbeat_interval_variance(beat_times=self._cache_tempogram["beat_times"], normalize=True)
+        """Deprecated compatibility alias for :meth:`_tempo_performance_variability`."""
+        return self._tempo_performance_variability(
+            bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum
+        )
 
-        curve_score = float(np.clip(np.mean(curve)/50.0, 0.0, 1.0)) if curve.size > 0 else 0.0
-        fluc_score = float(np.clip(np.tanh(fluc/10.0), 0.0, 1.0))
-        ibi_score = float(np.clip(np.tanh(ibi_var), 0.0, 1.0))
-
-        val = float(np.clip(
-            0.40*curve_score +
-            0.35*fluc_score +
-            0.25*ibi_score,
-            0.0, 1.0
-        ))
-
-        self._cache_tempogram[key] = val
-        return val
-    
     def _mode_tempogram(self, bpm_min=40.0, bpm_max=240.0, norm_sum=True):
+        """
+        Return no mode evidence.
+
+        Rhythm/tempo features do not provide a reliable major/minor estimate;
+        Chroma owns key and mode estimation in the feature pipeline.
+        """
         key = f"mode_tempogram_{bpm_min}_{bpm_max}_{norm_sum}"
         if key in self._cache_tempogram:
             return self._cache_tempogram[key]
 
-        # Tempo features carry no reliable major/minor signal.
-        # Return neutral scores and let Chroma/Frequency modules own mode.
         out = {
-            "mode":        "major",   # neutral default — will be overridden by fusion
-            "score_major": 0.5,
-            "score_minor": 0.5,
-            "delta_score": 0.0
+            "mode": None,
+            "mode_value": None,
+            "score_major": None,
+            "score_minor": None,
+            "delta_score": None,
+            "confidence": 0.0,
         }
-
         self._cache_tempogram[key] = out
         return out
-    
+
     def _time_signature_tempogram(self, bpm_min=40.0, bpm_max=240.0, norm_sum=True):
+        """
+        Estimate simple meter from beat-period autocorrelation.
+
+        The result is evidence for 3/4 versus 4/4 only. Other meters and
+        compound meters require a dedicated meter model, so confidence should
+        be treated as evidence strength rather than calibrated probability.
+        """
         key = f"time_signature_tempogram_{bpm_min}_{bpm_max}_{norm_sum}"
         if key in self._cache_tempogram:
             return self._cache_tempogram[key]
 
-        g = self._global_bpm(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum)
-        m = self._multi_periodic_structure(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum)
-        p = self._pulse_clarity(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum)
-        s = self._tempo_stability_index(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum)
-
+        g = self._global_bpm(
+            bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum
+        )
         bpm = float(g["bpm"])
+        global_ac = np.asarray(g["global_ac"], dtype=float)
 
-        structure_score = float(m.get("score", 0.0))
-        clarity_score = float(p.get("clarity", 0.0))
-        stability_score = float(s.get("stability", 0.0))
+        if bpm <= 0.0 or global_ac.size < 2:
+            out = {
+                "time_signature": None,
+                "confidence": 0.0,
+                "primary_bpm": bpm,
+                "score_3": 0.0,
+                "score_4": 0.0,
+                "structure_score": 0.0,
+            }
+            self._cache_tempogram[key] = out
+            return out
 
-        confidence = float(np.clip(
-            0.50 * structure_score +
-            0.30 * clarity_score +
-            0.20 * stability_score,
-            0.0, 1.0
-        ))
+        beat_lag = self.frame_rate * 60.0 / bpm
 
-        half_bpm = float(m.get("half_bpm", 0.0))
-        double_bpm = float(m.get("double_bpm", 0.0))
-        primary_bpm = float(m.get("primary_bpm", bpm))
+        def ac_at_lag(lag_float):
+            lo = int(np.floor(lag_float))
+            hi = lo + 1
+            if lo < 0 or hi >= global_ac.size:
+                return 0.0
+            frac = lag_float - lo
+            return float((1.0 - frac) * global_ac[lo] + frac * global_ac[hi])
 
-        is_triple_meter = False
-        if half_bpm > 0 and primary_bpm > 0:
-            ratio = half_bpm/primary_bpm
+        score_4_half = ac_at_lag(beat_lag * 2.0)
+        score_4_full = ac_at_lag(beat_lag * 4.0)
+        score_3_full = ac_at_lag(beat_lag * 3.0)
 
-            if abs(ratio - 0.333) < 0.08 or abs(ratio - 0.666) < 0.08:
-                is_triple_meter = True
+        score_4 = 0.6 * score_4_half + 0.4 * score_4_full
+        score_3 = score_3_full
+        total = score_3 + score_4 + EPS
 
-        if confidence >= 0.40:
-            ts = 3 if is_triple_meter else 4
-        else:
+        if score_4 >= score_3:
             ts = 4
+            winner = score_4
+            runner_up = score_3
+        else:
+            ts = 3
+            winner = score_3
+            runner_up = score_4
+
+        margin_confidence = float(np.clip(
+            (winner - runner_up) / total, 0.0, 1.0
+        ))
+        structure_strength = float(np.clip(max(score_3, score_4), 0.0, 1.0))
+        confidence = float(np.clip(
+            0.5 * margin_confidence + 0.5 * structure_strength,
+            0.0,
+            1.0,
+        ))
 
         out = {
             "time_signature": int(ts),
             "confidence": confidence,
             "primary_bpm": bpm,
-            "structure_score": structure_score
+            "score_3": float(score_3),
+            "score_4": float(score_4),
+            "structure_score": structure_strength,
         }
 
         self._cache_tempogram[key] = out
         return out
-    
-    def spotify_audio_features(self, beat_times=None, beat_frames=None, bpm_min=40.0, bpm_max=240.0, norm_sum=True):
-        loudness_per_beat = self._loudness_tempogram_per_beat(beat_times=beat_times, beat_frames=beat_frames)
+
+    def tempogram_domain_evidence(
+        self,
+        beat_times=None,
+        beat_frames=None,
+        bpm_min=40.0,
+        bpm_max=240.0,
+        norm_sum=True,
+    ):
+        """
+        Return rhythm-domain evidence for the central fusion/model layer.
+
+        Values named here are model inputs/proxies, not claims to reproduce
+        Spotify's proprietary Audio Features implementation.
+        """
+        global_bpm = self._global_bpm(
+            bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum
+        )
+        rhythmic_drive = self._rhythmic_drive(
+            bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum
+        )
+        rhythmic_coherence = self._rhythmic_coherence(
+            bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum
+        )
+        performance_variability = self._tempo_performance_variability(
+            bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum
+        )
+        time_signature = self._time_signature_tempogram(
+            bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum
+        )
+        periodicity = self._beat_periodicity_strength(
+            bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum
+        )
+        stability = self._tempo_stability_index(
+            bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum
+        )
+
+        loudness_per_beat = self._loudness_tempogram_per_beat(
+            beat_times=beat_times, beat_frames=beat_frames
+        )
+
         return {
+            "tempo_bpm": float(global_bpm["bpm"]),
+            "tempo_confidence": float(global_bpm.get("confidence", 0.0)),
+            "tempo_strength": float(global_bpm.get("strength", 0.0)),
+            "tempo_secondary_bpm": float(global_bpm.get("secondary_bpm", 0.0)),
+            "tempo_secondary_strength": float(global_bpm.get("secondary_strength", 0.0)),
+            "rhythmic_drive": float(rhythmic_drive),
+            "rhythmic_coherence": float(rhythmic_coherence),
+            "performance_variability": float(performance_variability),
+            "beat_periodicity_strength": float(periodicity["strength"]),
+            "tempo_stability": float(stability["stability"]),
+            "time_signature": time_signature["time_signature"],
+            "time_signature_confidence": float(time_signature["confidence"]),
+            "time_signature_score_3": float(time_signature["score_3"]),
+            "time_signature_score_4": float(time_signature["score_4"]),
             "loudness_per_beat": loudness_per_beat,
-            "danceability": self._danceability_tempogram(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum),
-            "valence": self._valence_tempogram(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum),
-            "liveness": self._liveness_tempogram(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum),
-            "mode": self._mode_tempogram(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum)["mode"],
-            "time_signature": self._time_signature_tempogram(bpm_min=bpm_min, bpm_max=bpm_max, norm_sum=norm_sum)["time_signature"],
+            "mode": None,
+            "mode_value": None,
+            "mode_confidence": 0.0,
+            "valence_evidence": None,
+            "liveness_evidence": None,
         }
+
+    def spotify_audio_features(
+        self,
+        beat_times=None,
+        beat_frames=None,
+        bpm_min=40.0,
+        bpm_max=240.0,
+        norm_sum=True,
+    ):
+        """Backward-compatible alias for :meth:`tempogram_domain_evidence`."""
+        return self.tempogram_domain_evidence(
+            beat_times=beat_times,
+            beat_frames=beat_frames,
+            bpm_min=bpm_min,
+            bpm_max=bpm_max,
+            norm_sum=norm_sum,
+        )
+
